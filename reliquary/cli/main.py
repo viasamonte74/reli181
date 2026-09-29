@@ -27,6 +27,8 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
     MINER_GENERATION_BACKEND,
     MINER_VLLM_MAX_NUM_SEQS,
+    MINER_VLLM_RESERVE_GIB,
+    MINER_VLLM_SHARED_DEVICE_RESERVE_GIB,
     PROOF_SLOTS_PER_DEVICE,
     PROTOCOL_MODEL_ID,
     PROTOCOL_MODEL_REVISION,
@@ -1801,13 +1803,19 @@ def mine(
         # Use 2 GPUs when available (vllm on 0, HF proof on 1). Fall back to
         # sharing GPU 0 for test boxes that only expose one device.
         proof_device = "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0"
+        # Under vLLM the transformers generation copy only supplies eos ids,
+        # dtype and attention metadata; on the GPU it would take ~8 GB of KV
+        # cache from vLLM.
+        generation_device = (
+            "cpu" if MINER_GENERATION_BACKEND == "vllm" else "cuda:0"
+        )
 
         vllm_model = load_text_generation_model(
             initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
             **base_load_kwargs,
-        ).to("cuda:0").eval()
+        ).to(generation_device).eval()
 
         hf_model = load_text_generation_model(
             initial_path,
@@ -1822,11 +1830,11 @@ def mine(
         envs = load_environments(env_names)
         generator = None
         if MINER_GENERATION_BACKEND == "vllm":
-            from reliquary.miner.vllm_generation import VLLMRolloutGenerator
+            from reliquary.miner.vllm_generation import (
+                VLLMRolloutGenerator,
+                gpu_memory_utilization_for,
+            )
 
-            # vLLM owns cuda:0, where the transformers generation copy also
-            # sits; on a single-device box that copy is only read for its eos
-            # ids and device, so the two coexist at a lower utilisation.
             # Cap the context at the longest profile completion plus room for
             # the prompt. The model default (32k) does not fit in the KV cache
             # beside that proof copy.
@@ -1834,14 +1842,25 @@ def mine(
                 spec.max_new_tokens
                 for spec in ACTIVE_PROTOCOL_PROFILE.environments.values()
             )
+            shared_device = proof_device == "cuda:0"
+            reserve_gib = (
+                MINER_VLLM_SHARED_DEVICE_RESERVE_GIB
+                if shared_device else MINER_VLLM_RESERVE_GIB
+            )
+            gpu_memory_utilization = gpu_memory_utilization_for(
+                0, reserve_gib * 2**30,
+            )
+            logger.info(
+                "vLLM on cuda:0 with gpu_memory_utilization=%.3f "
+                "(proof on %s, reserve %.1f GiB)",
+                gpu_memory_utilization, proof_device, reserve_gib,
+            )
             generator = VLLMRolloutGenerator(
                 initial_path,
                 revision=base_load_kwargs.get("revision"),
                 max_num_seqs=MINER_VLLM_MAX_NUM_SEQS,
                 max_model_len=max_new_tokens + 8192,
-                gpu_memory_utilization=(
-                    0.85 if proof_device != "cuda:0" else 0.6
-                ),
+                gpu_memory_utilization=gpu_memory_utilization,
             )
 
         engine = MiningEngine(
@@ -1852,6 +1871,7 @@ def mine(
             envs=envs,
             mix=mix,
             generator=generator,
+            generation_device=generation_device,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
             checkpoint_identity_store=checkpoint_identity_store,

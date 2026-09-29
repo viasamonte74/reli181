@@ -124,6 +124,25 @@ def _install_transformers5_tokenizer_compat() -> None:
     tokenizer_mod.get_cached_tokenizer = get_cached_tokenizer
 
 
+def gpu_memory_utilization_for(
+    device: int, reserve_bytes: float, *, mem_get_info: Any = None,
+    cap: float = 0.92, floor: float = 0.2,
+) -> float:
+    """vLLM's ``gpu_memory_utilization`` sized from what is free right now.
+
+    vLLM reads the fraction against the device's total memory and refuses to
+    start when that exceeds free memory, so a fixed fraction either wastes a
+    card that holds nothing else or fails beside a model already resident.
+    """
+    if mem_get_info is None:
+        mem_get_info = torch.cuda.mem_get_info
+    free, total = mem_get_info(device)
+    if total <= 0:
+        return floor
+    fraction = (float(free) - float(reserve_bytes)) / float(total)
+    return round(min(cap, max(floor, fraction)), 3)
+
+
 def _slot_index(value: Any) -> int:
     return int(value[0] if isinstance(value, (tuple, list)) else value)
 

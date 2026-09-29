@@ -8,12 +8,14 @@ Merkle root commitment, HTTP batch submission to validator.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import math
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -855,6 +857,73 @@ def _bft_assemble_rollouts(
     return out
 
 
+@dataclass
+class _PreparedGroup:
+    """A screened group waiting for its proof, with the state it was drawn in."""
+
+    state: Any
+    env_name: str
+    env: Any
+    prompt_idx: int
+    problem: dict
+    generations: list[dict]
+    rewards: list[float] | None
+    checkpoint_hash: str
+
+
+def _resolve_pipeline_depth(
+    configured: int | None, *, generation_gpu: int, proof_gpu: int,
+) -> int:
+    if configured is not None:
+        return max(0, int(configured))
+    from reliquary.constants import MINER_PIPELINE_DEPTH
+
+    if MINER_PIPELINE_DEPTH is not None:
+        return MINER_PIPELINE_DEPTH
+    return 1 if generation_gpu != proof_gpu else 0
+
+
+def _cuda_device_scope(index: int):
+    """Pin a worker thread's current CUDA device; kernels that read the
+    current device instead of the tensor's must not land on the other GPU."""
+    try:
+        import torch
+    except ImportError:
+        return contextlib.nullcontext()
+    if not torch.cuda.is_available():
+        return contextlib.nullcontext()
+    return torch.cuda.device(index)
+
+
+def _stale_group_reason(
+    group: _PreparedGroup, *, latest_state, checkpoint_hash: str,
+) -> str | None:
+    """Why a queued group is already unsubmittable, before paying for its proof."""
+    if group.checkpoint_hash != checkpoint_hash:
+        return "checkpoint_changed"
+    if latest_state is None:
+        return None
+    if latest_state.window_n != group.state.window_n:
+        return "window_changed"
+    if latest_state.randomness != group.state.randomness:
+        return "randomness_changed"
+    return None
+
+
+@contextlib.asynccontextmanager
+async def _proof_stage(drain, enabled: bool):
+    """Run ``drain`` as the proof/submit task for the life of the block."""
+    if not enabled:
+        yield None
+        return
+    task = asyncio.create_task(drain())
+    try:
+        yield task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def _rollout_metadata(generation: dict, token_logprobs: list) -> dict:
     """Per-rollout metadata embedded in the GRAIL commit. Carries the BFT
     ``forced`` flag and ``force_span`` so the validator carve-out and trainer
@@ -894,6 +963,8 @@ class MiningEngine:
         checkpoint_identity_store: MinerCheckpointIdentityStore | None = None,
         initial_checkpoint_identity: ActivatedCheckpoint | None = None,
         generator: Any | None = None,
+        generation_device: str | None = None,
+        pipeline_depth: int | None = None,
     ) -> None:
         # When set, single-turn rollouts come from this engine instead of
         # ``vllm_model.generate``; the proof still runs on ``hf_model``.
@@ -904,6 +975,10 @@ class MiningEngine:
         self.wallet = wallet
         self.vllm_gpu = vllm_gpu
         self.proof_gpu = proof_gpu
+        # Where the transformers generation copy lives. ``None`` means
+        # ``cuda:{vllm_gpu}``; the vLLM backend keeps it on the host.
+        self.generation_device = generation_device
+        self.pipeline_depth = pipeline_depth
         self.max_new_tokens = max_new_tokens
         self.validator_url_override = validator_url_override
         self._checkpoint_identity_store = (
@@ -1009,7 +1084,7 @@ class MiningEngine:
         import httpx
         import random
 
-        from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
+        from reliquary.constants import POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
             EndpointNotFoundError,
             NoActiveWindowError,
@@ -1080,11 +1155,164 @@ class MiningEngine:
         )
 
         submitted = asyncio.Event()
+        # Generation (vllm_gpu) and proof (proof_gpu) overlap: while one
+        # group is proved and submitted, the next is already generating.
+        # Checkpoint activation swaps both models, so it waits for any proof
+        # in flight; queued groups from the old checkpoint are then dropped.
+        pipeline_depth = _resolve_pipeline_depth(
+            getattr(self, "pipeline_depth", None),
+            generation_gpu=self.vllm_gpu,
+            proof_gpu=self.proof_gpu,
+        )
+        proof_queue: asyncio.Queue[_PreparedGroup] = asyncio.Queue(
+            maxsize=max(1, pipeline_depth),
+        )
+        activation_lock = asyncio.Lock()
+        latest_state = None
+        runtime_fingerprint = None
+        logger.info(
+            "miner pipeline: generation cuda:%d, proof cuda:%d, depth=%d",
+            self.vllm_gpu, self.proof_gpu, pipeline_depth,
+        )
+
+        async def release(group: _PreparedGroup) -> None:
+            nonlocal miner_state_etag, cached_miner_state
+            state = group.state
+            env_name, env, prompt_idx = group.env_name, group.env, group.prompt_idx
+            stale = _stale_group_reason(
+                group, latest_state=latest_state, checkpoint_hash=local_hash,
+            )
+            if stale is not None:
+                logger.info(
+                    "discarding queued group before proof: reason=%s window=%d "
+                    "env=%s prompt=%d",
+                    stale, state.window_n, env_name, prompt_idx,
+                )
+                return
+            async with activation_lock:
+                request, upload_skip = await asyncio.to_thread(
+                    self._prove_group, group, runtime_fingerprint,
+                )
+            if upload_skip is not None:
+                logger.info(
+                    "skipping upload: reason=%s window=%d env=%s prompt=%d",
+                    upload_skip, state.window_n, env_name, prompt_idx,
+                )
+                return
+
+            # Generation and proof construction can span a state
+            # transition. Re-read the exact live lane immediately before
+            # precommit and discard stale work locally.
+            try:
+                if miner_state_supported is not False:
+                    refreshed, miner_state_etag = await get_miner_state_v1(
+                        url,
+                        client=client,
+                        etag=miner_state_etag,
+                    )
+                    if refreshed is not None:
+                        cached_miner_state = refreshed
+                    release_state = cached_miner_state
+                    if release_state is None:
+                        raise SubmissionError(
+                            "missing cached miner-state at release"
+                        )
+                    env_release = release_state.environments.get(env_name)
+                    if env_release is None:
+                        raise SubmissionError(
+                            "release state omitted the selected environment"
+                        )
+                    release_cooldown = env_release.cooldown_prompts()
+                    release_range = env_release.prompt_range
+                    release_accepting = env_release.accepting_submissions
+                else:
+                    release_state = await get_window_state_v2(
+                        url,
+                        env=env_name,
+                        client=client,
+                    )
+                    release_cooldown = set(release_state.cooldown_prompts)
+                    release_range = window_prompt_range(
+                        release_state.randomness,
+                        getattr(env, "name", env_name),
+                        len(env),
+                        PROMPT_RANGE_SIZE,
+                    )
+                    release_accepting = None
+            except Exception as exc:
+                logger.info(
+                    "state recheck failed; discarding prepared work: %s",
+                    exc,
+                )
+                return
+
+            mismatch = _release_state_mismatch_reason(
+                initial_state=state,
+                release_state=release_state,
+                request=request,
+                environment_name=getattr(env, "name", env_name),
+                environment_size=len(env),
+                cooldown_prompts=release_cooldown,
+                prompt_range=release_range,
+                accepting_submissions=release_accepting,
+            )
+            if mismatch is not None:
+                logger.info(
+                    "discarding prepared work before ingress: reason=%s "
+                    "window=%d prompt=%d",
+                    mismatch,
+                    request.window_start,
+                    request.prompt_idx,
+                )
+                return
+            try:
+                resp = await submit_batch_v2(
+                    url,
+                    request,
+                    client=client,
+                    wallet=self.wallet,
+                    randomness=state.randomness or "",
+                    drand_round_fn=_current_drand_round_at_send,
+                )
+                logger.info(
+                    "submitted window=%d prompt=%d accepted=%s reason=%s",
+                    state.window_n, prompt_idx, resp.accepted,
+                    resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
+                )
+                results.append(resp)
+                if resp.accepted:
+                    submitted.set()
+                elif resp._retry_after_seconds is not None:
+                    await asyncio.sleep(resp._retry_after_seconds)
+            except SubmissionError as exc:
+                logger.error("submit failed: %s", exc)
+
+        async def drain() -> None:
+            while True:
+                group = await proof_queue.get()
+                try:
+                    await release(group)
+                finally:
+                    proof_queue.task_done()
+
+        async def hand_off(group: _PreparedGroup, consumer) -> None:
+            if consumer is None:
+                await release(group)
+                return
+            put = asyncio.ensure_future(proof_queue.put(group))
+            done, _ = await asyncio.wait(
+                {put, consumer}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if put not in done:
+                put.cancel()
+                consumer.result()
+                raise RuntimeError("proof stage stopped")
+
         async with (
             httpx.AsyncClient(timeout=30, limits=httpx.Limits(keepalive_expiry=30)) as client,
             monitor_submission_verdicts(url, self.wallet.hotkey.ss58_address, client, submitted),
+            _proof_stage(drain, pipeline_depth > 0) as consumer,
         ):
-            runtime_fingerprint = None
             try:
                 contract = await get_runtime_contract_v1(url, client=client)
                 runtime_fingerprint = RuntimeFingerprint.model_validate(
@@ -1107,6 +1335,9 @@ class MiningEngine:
                 runtime_fingerprint = None
                 logger.info("validator runtime telemetry unavailable")
             while True:
+                if consumer is not None and consumer.done():
+                    consumer.result()
+                    raise RuntimeError("proof stage stopped")
                 try:
                     if miner_state_supported is not False:
                         try:
@@ -1164,6 +1395,7 @@ class MiningEngine:
                     logger.debug("state fetch failed: %s", e)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
+                latest_state = state
 
                 # Legacy compatibility stays exact: gather every environment
                 # for one immutable window or wait. Never substitute the first
@@ -1220,16 +1452,26 @@ class MiningEngine:
                         continue
 
                 # Pull new checkpoint if needed (works at any state).
-                try:
-                    pulled = await maybe_pull_checkpoint(
-                        state=state,
-                        local_n=local_n,
-                        local_hash=local_hash,
-                        local_repo_id=local_repo_id,
-                        local_model=self.hf_model,
-                        download_fn=_hf_download,
-                        load_fn=self._load_checkpoint,
+                advertised = checkpoint_identity_from_state(state)
+                activation_scope = (
+                    activation_lock
+                    if advertised is not None and (
+                        advertised.repo_id != local_repo_id
+                        or advertised.oid != local_hash
                     )
+                    else contextlib.nullcontext()
+                )
+                try:
+                    async with activation_scope:
+                        pulled = await maybe_pull_checkpoint(
+                            state=state,
+                            local_n=local_n,
+                            local_hash=local_hash,
+                            local_repo_id=local_repo_id,
+                            local_model=self.hf_model,
+                            download_fn=_hf_download,
+                            load_fn=self._load_checkpoint,
+                        )
                     pulled_n, pulled_repo, pulled_hash, pulled_model = pulled
                     if pulled_repo and pulled_hash:
                         try:
@@ -1366,198 +1608,156 @@ class MiningEngine:
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
-                environment_spec = get_environment_spec(env_name)
-                if environment_spec.interaction_mode == "episode":
-                    generations = self._generate_m_episode_rollouts(
-                        env,
-                        randomness,
-                        prompt_idx=prompt_idx,
-                        checkpoint_hash=local_hash,
-                    )
-                elif self._local_zone_filter_applies(env_name, env):
-                    generations, screen_reason = self._generate_zone_screened_rollouts(
-                        problem, randomness, env_name=env_name,
-                        prompt_idx=prompt_idx, checkpoint_hash=local_hash,
-                        env=env,
-                    )
-                    if screen_reason is not None:
-                        logger.info(
-                            "skipping before the tail: reason=%s window=%d "
-                            "env=%s prompt=%d",
-                            screen_reason, state.window_n, env_name, prompt_idx,
-                        )
-                        continue
-                else:
-                    generations = self._generate_m_rollouts(
-                        problem, randomness, env_name=env_name,
-                        prompt_idx=prompt_idx, checkpoint_hash=local_hash,
-                    )
-                if len(generations) < M_ROLLOUTS:
-                    logger.warning(
-                        "generated %d/%d for prompt %d; skipping",
-                        len(generations), M_ROLLOUTS, prompt_idx,
-                    )
-                    continue
-
-                if self._code_zone_screen_applies(env_name, env):
-                    code_skip = self._code_zone_screen_reason(
-                        env, problem, generations,
-                    )
-                    if code_skip is not None:
-                        logger.info(
-                            "skipping proof: reason=%s window=%d env=%s "
-                            "prompt=%d",
-                            code_skip, state.window_n, env_name, prompt_idx,
-                        )
-                        continue
-                    if getattr(self, "generator", None) is not None:
-                        for index, generation in enumerate(generations):
-                            generation["screen_termination"] = True
-                            generation["rollout_index"] = index
-                            generation["prompt_idx"] = prompt_idx
-                            generation["checkpoint_hash"] = local_hash
-                            generation["env_name"] = env_name
-
-                local_rewards = None
-                if self._local_zone_filter_applies(env_name, env):
-                    from reliquary.shared.modeling import resolve_eos_token_ids
-
-                    completions, texts, local_rewards = self._score_generations(
-                        env, problem, generations,
-                    )
-                    skip_reason = _local_zone_skip_reason(
-                        env_name=env_name,
-                        rewards=local_rewards,
-                        completions=completions,
-                        texts=texts,
-                        eos_ids=resolve_eos_token_ids(
-                            self.vllm_model, self.tokenizer,
-                        ),
-                    )
-                    if skip_reason is not None:
-                        logger.info(
-                            "skipping proof: reason=%s window=%d env=%s "
-                            "prompt=%d correct=%d/%d",
-                            skip_reason, state.window_n, env_name, prompt_idx,
-                            sum(1 for r in local_rewards if r >= 0.5),
-                            len(local_rewards),
-                        )
-                        continue
-
-                request = self.build_batch_request_from_generations(
-                    generations=generations,
+                screened = await asyncio.to_thread(
+                    self._generate_screened_group,
+                    env_name=env_name,
+                    env=env,
                     problem=problem,
-                    environment=env,
-                    randomness=randomness,
                     prompt_idx=prompt_idx,
-                    window_number=state.window_n,
-                    checkpoint_revision=local_hash,
-                    runtime_fingerprint=runtime_fingerprint,
-                    rewards=local_rewards,
+                    randomness=randomness,
+                    checkpoint_hash=local_hash,
+                    window_n=state.window_n,
                 )
-                if env_name == "opencodeinstruct":
-                    upload_skip = _termination_upload_skip_reason(
-                        env_name,
-                        [g.get("termination_kind") for g in generations],
-                    )
-                    if upload_skip is not None:
-                        logger.info(
-                            "skipping upload: reason=%s window=%d env=%s "
-                            "prompt=%d",
-                            upload_skip, state.window_n, env_name, prompt_idx,
-                        )
-                        continue
-
-                # Generation and proof construction can span a state
-                # transition. Re-read the exact live lane immediately before
-                # precommit and discard stale work locally.
-                try:
-                    if miner_state_supported is not False:
-                        refreshed, miner_state_etag = await get_miner_state_v1(
-                            url,
-                            client=client,
-                            etag=miner_state_etag,
-                        )
-                        if refreshed is not None:
-                            cached_miner_state = refreshed
-                        release_state = cached_miner_state
-                        if release_state is None:
-                            raise SubmissionError(
-                                "missing cached miner-state at release"
-                            )
-                        env_release = release_state.environments.get(env_name)
-                        if env_release is None:
-                            raise SubmissionError(
-                                "release state omitted the selected environment"
-                            )
-                        release_cooldown = env_release.cooldown_prompts()
-                        release_range = env_release.prompt_range
-                        release_accepting = env_release.accepting_submissions
-                    else:
-                        release_state = await get_window_state_v2(
-                            url,
-                            env=env_name,
-                            client=client,
-                        )
-                        release_cooldown = set(
-                            release_state.cooldown_prompts
-                        )
-                        release_range = window_prompt_range(
-                            release_state.randomness,
-                            getattr(env, "name", env_name),
-                            len(env),
-                            PROMPT_RANGE_SIZE,
-                        )
-                        release_accepting = None
-                except Exception as exc:
-                    logger.info(
-                        "state recheck failed; discarding prepared work: %s",
-                        exc,
-                    )
+                if screened is None:
                     continue
-
-                mismatch = _release_state_mismatch_reason(
-                    initial_state=state,
-                    release_state=release_state,
-                    request=request,
-                    environment_name=getattr(env, "name", env_name),
-                    environment_size=len(env),
-                    cooldown_prompts=release_cooldown,
-                    prompt_range=release_range,
-                    accepting_submissions=release_accepting,
+                generations, local_rewards = screened
+                await hand_off(
+                    _PreparedGroup(
+                        state=state,
+                        env_name=env_name,
+                        env=env,
+                        prompt_idx=prompt_idx,
+                        problem=problem,
+                        generations=generations,
+                        rewards=local_rewards,
+                        checkpoint_hash=local_hash,
+                    ),
+                    consumer,
                 )
-                if mismatch is not None:
-                    logger.info(
-                        "discarding prepared work before ingress: reason=%s "
-                        "window=%d prompt=%d",
-                        mismatch,
-                        request.window_start,
-                        request.prompt_idx,
-                    )
-                    continue
-                try:
-                    resp = await submit_batch_v2(
-                        url,
-                        request,
-                        client=client,
-                        wallet=self.wallet,
-                        randomness=state.randomness or "",
-                        drand_round_fn=_current_drand_round_at_send,
-                    )
-                    logger.info(
-                        "submitted window=%d prompt=%d accepted=%s reason=%s",
-                        state.window_n, prompt_idx, resp.accepted,
-                        resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
-                    )
-                    results.append(resp)
-                    if resp.accepted:
-                        submitted.set()
-                    elif resp._retry_after_seconds is not None:
-                        await asyncio.sleep(resp._retry_after_seconds)
-                except SubmissionError as exc:
-                    logger.error("submit failed: %s", exc)
 
         return results
+
+    def _generate_screened_group(
+        self, *, env_name: str, env, problem, prompt_idx: int,
+        randomness: str, checkpoint_hash: str, window_n: int,
+    ) -> tuple[list[dict], list[float] | None] | None:
+        """Generation-GPU half of one prompt: rollouts, then every local screen.
+
+        Returns ``None`` (already logged) when the group should not be proved.
+        Rewards are computed here for every locally-rewarded group so the proof
+        thread never touches the tokenizer, which is not safe to share across
+        threads.
+        """
+        with _cuda_device_scope(self.vllm_gpu):
+            environment_spec = get_environment_spec(env_name)
+            if environment_spec.interaction_mode == "episode":
+                generations = self._generate_m_episode_rollouts(
+                    env,
+                    randomness,
+                    prompt_idx=prompt_idx,
+                    checkpoint_hash=checkpoint_hash,
+                )
+            elif self._local_zone_filter_applies(env_name, env):
+                generations, screen_reason = self._generate_zone_screened_rollouts(
+                    problem, randomness, env_name=env_name,
+                    prompt_idx=prompt_idx, checkpoint_hash=checkpoint_hash,
+                    env=env,
+                )
+                if screen_reason is not None:
+                    logger.info(
+                        "skipping before the tail: reason=%s window=%d "
+                        "env=%s prompt=%d",
+                        screen_reason, window_n, env_name, prompt_idx,
+                    )
+                    return None
+            else:
+                generations = self._generate_m_rollouts(
+                    problem, randomness, env_name=env_name,
+                    prompt_idx=prompt_idx, checkpoint_hash=checkpoint_hash,
+                )
+        if len(generations) < M_ROLLOUTS:
+            logger.warning(
+                "generated %d/%d for prompt %d; skipping",
+                len(generations), M_ROLLOUTS, prompt_idx,
+            )
+            return None
+
+        if self._code_zone_screen_applies(env_name, env):
+            code_skip = self._code_zone_screen_reason(env, problem, generations)
+            if code_skip is not None:
+                logger.info(
+                    "skipping proof: reason=%s window=%d env=%s prompt=%d",
+                    code_skip, window_n, env_name, prompt_idx,
+                )
+                return None
+            if getattr(self, "generator", None) is not None:
+                from reliquary.shared.modeling import resolve_eos_token_ids
+
+                eos_ids = sorted(resolve_eos_token_ids(self.vllm_model, self.tokenizer))
+                for index, generation in enumerate(generations):
+                    generation["screen_termination"] = True
+                    generation["rollout_index"] = index
+                    generation["prompt_idx"] = prompt_idx
+                    generation["checkpoint_hash"] = checkpoint_hash
+                    generation["env_name"] = env_name
+                    generation["eos_ids"] = eos_ids
+
+        local_rewards = None
+        if self._local_zone_filter_applies(env_name, env):
+            from reliquary.shared.modeling import resolve_eos_token_ids
+
+            completions, texts, local_rewards = self._score_generations(
+                env, problem, generations,
+            )
+            skip_reason = _local_zone_skip_reason(
+                env_name=env_name,
+                rewards=local_rewards,
+                completions=completions,
+                texts=texts,
+                eos_ids=resolve_eos_token_ids(self.vllm_model, self.tokenizer),
+            )
+            if skip_reason is not None:
+                logger.info(
+                    "skipping proof: reason=%s window=%d env=%s "
+                    "prompt=%d correct=%d/%d",
+                    skip_reason, window_n, env_name, prompt_idx,
+                    sum(1 for r in local_rewards if r >= 0.5),
+                    len(local_rewards),
+                )
+                return None
+        elif (
+            generations[0].get("trace") is None
+            and not getattr(env, "validator_authoritative_reward", False)
+        ):
+            _, _, local_rewards = self._score_generations(env, problem, generations)
+        return generations, local_rewards
+
+    def _prove_group(self, group: _PreparedGroup, runtime_fingerprint):
+        """Proof-GPU half: GRAIL commits for all rollouts, then the Code
+        termination screen that needs the proof logits.
+
+        Returns ``(request, None)`` to submit or ``(None, reason)`` to drop.
+        """
+        with _cuda_device_scope(self.proof_gpu):
+            request = self.build_batch_request_from_generations(
+                generations=group.generations,
+                problem=group.problem,
+                environment=group.env,
+                randomness=group.state.randomness,
+                prompt_idx=group.prompt_idx,
+                window_number=group.state.window_n,
+                checkpoint_revision=group.checkpoint_hash,
+                runtime_fingerprint=runtime_fingerprint,
+                rewards=group.rewards,
+            )
+        if group.env_name == "opencodeinstruct":
+            upload_skip = _termination_upload_skip_reason(
+                group.env_name,
+                [g.get("termination_kind") for g in group.generations],
+            )
+            if upload_skip is not None:
+                return None, upload_skip
+        return request, None
 
     def _load_checkpoint(self, local_path: str):
         """Reload both hf_model and vllm_model from *local_path*.
@@ -1578,13 +1778,17 @@ class MiningEngine:
 
         logger.info("Loading checkpoint from %s", local_path)
 
-        def _load_one(device: int):
+        def _load_one(device: str):
             return load_text_generation_model(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
-            ).to(f"cuda:{device}").eval()
+            ).to(device).eval()
 
+        proof_device = f"cuda:{self.proof_gpu}"
+        generation_device = (
+            getattr(self, "generation_device", None) or f"cuda:{self.vllm_gpu}"
+        )
         old_hf = self.hf_model
         old_gen = self.vllm_model
 
@@ -1599,8 +1803,8 @@ class MiningEngine:
                 old_hf.to("cpu")
                 old_gen.to("cpu")
                 torch.cuda.empty_cache()
-                new_hf = _load_one(self.proof_gpu)
-                new_gen = _load_one(self.vllm_gpu)
+                new_hf = _load_one(proof_device)
+                new_gen = _load_one(generation_device)
             except Exception as exc:
                 del new_hf
                 del new_gen
@@ -1627,7 +1831,7 @@ class MiningEngine:
         # fails, the previous generation/proof pair and checkpoint identity
         # remain active together.
         try:
-            new_hf = _load_one(self.proof_gpu)
+            new_hf = _load_one(proof_device)
         except Exception:
             logger.exception(
                 "Failed to reload hf_model from %s; keeping old model",
@@ -1636,7 +1840,7 @@ class MiningEngine:
             raise
 
         try:
-            new_gen = _load_one(self.vllm_gpu)
+            new_gen = _load_one(generation_device)
         except Exception:
             logger.exception(
                 "Failed to stage vllm_model from %s; keeping the prior "
@@ -2128,7 +2332,10 @@ class MiningEngine:
                 generation["termination_kind"] = _proof_termination_kind(
                     tokens=all_tokens,
                     prompt_length=prompt_length,
-                    eos_ids=resolve_eos_token_ids(self.hf_model, self.tokenizer),
+                    eos_ids=(
+                        generation.get("eos_ids")
+                        or resolve_eos_token_ids(self.hf_model, self.tokenizer)
+                    ),
                     cap=max_new_tokens_for_environment(
                         str(generation.get("env_name") or "opencodeinstruct"),
                     ),

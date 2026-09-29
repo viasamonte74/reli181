@@ -1544,6 +1544,26 @@ MINER_VLLM_MAX_NUM_SEQS = int(
 MINER_LOCAL_ZONE_FILTER = _os.environ.get(
     "RELIQUARY_MINER_LOCAL_ZONE_FILTER", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
+# Screened groups allowed to wait for the proof GPU while the generation GPU
+# starts the next prompt. "auto" is 1 when generation and proof sit on separate
+# devices and 0 (strictly sequential) when they share one. Every queued group
+# is re-checked against live state before its proof, so depth only trades
+# staleness risk against idle GPU time.
+_MINER_PIPELINE_DEPTH_RAW = _os.environ.get(
+    "RELIQUARY_MINER_PIPELINE_DEPTH", "auto"
+).strip().lower()
+MINER_PIPELINE_DEPTH: int | None = (
+    None if _MINER_PIPELINE_DEPTH_RAW in ("", "auto")
+    else max(0, int(_MINER_PIPELINE_DEPTH_RAW))
+)
+# Memory vLLM leaves free on its device. On a shared single device the proof
+# forward (full-sequence logits) runs beside it and needs far more room.
+MINER_VLLM_RESERVE_GIB = float(
+    _os.environ.get("RELIQUARY_MINER_VLLM_RESERVE_GIB", "2")
+)
+MINER_VLLM_SHARED_DEVICE_RESERVE_GIB = float(
+    _os.environ.get("RELIQUARY_MINER_VLLM_SHARED_DEVICE_RESERVE_GIB", "12")
+)
 
 
 PPO_CLIP_EPSILON_LOW = 0.2
