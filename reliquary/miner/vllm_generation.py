@@ -174,7 +174,7 @@ class VLLMRolloutGenerator:
     def generate(
         self, prompt_tokens: list[int], *, randomness: str, prompt_idx: int,
         checkpoint_hash: str, rollouts: int, max_new_tokens: int,
-        eos_ids: list[int],
+        eos_ids: list[int], rollout_indices: list[int] | None = None,
     ) -> list[list[int]]:
         """Completion token ids per rollout, truncated at their first stop token.
 
@@ -188,7 +188,8 @@ class VLLMRolloutGenerator:
             from vllm import SamplingParams as sampling_params
 
         stop_ids = sorted(int(token) for token in eos_ids)
-        requests = [{"prompt_token_ids": list(prompt_tokens)} for _ in range(rollouts)]
+        indices = list(range(rollouts) if rollout_indices is None else rollout_indices)
+        requests = [{"prompt_token_ids": list(prompt_tokens)} for _ in indices]
         sampling = [
             sampling_params(
                 temperature=0.0, max_tokens=int(max_new_tokens), detokenize=False,
@@ -198,7 +199,7 @@ class VLLMRolloutGenerator:
                     checkpoint_hash=checkpoint_hash, rollout_index=index,
                 ),
             )
-            for index in range(rollouts)
+            for index in indices
         ]
         outputs = self._llm.generate(requests, sampling, use_tqdm=False)
         completions: list[list[int]] = []

@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import math
 import os
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import random as _random
 
@@ -46,9 +49,269 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Between windows the validator answers 503. Windows close on fill and select
+# FIFO, so re-poll at the same cadence as a non-OPEN state rather than the
+# error backoff; an explicit Retry-After is honoured up to that backoff.
+NO_ACTIVE_WINDOW_POLL_SECONDS = 1.0
+
+# First forced rollouts scored before the rest of a Math group is generated.
+# One clean correct and one clean wrong answer already clears σ; a long
+# unanimous prefix does not, and finishing it would lose the FIFO race.
+ZONE_SCREEN_ROLLOUTS = 4
+ZONE_SCREEN_LONG_FRACTION = 0.5
+
+# Bounds the fp32 [rows, vocab] block used for proof log-probs so a near-cap
+# rollout does not allocate a full-sequence fp32 copy of the logits.
+_LOGPROB_WORKSPACE_BYTES = 256 * 1024 * 1024
+
 
 class CheckpointActivationRestartRequired(RuntimeError):
     """Checkpoint activation cannot safely continue in the current process."""
+
+
+def _no_active_window_delay(exc: BaseException) -> float:
+    from reliquary.constants import POLL_INTERVAL_SECONDS
+
+    retry_after = getattr(exc, "retry_after", None)
+    try:
+        retry_after = float(retry_after)
+    except (TypeError, ValueError):
+        return NO_ACTIVE_WINDOW_POLL_SECONDS
+    if not math.isfinite(retry_after):
+        return NO_ACTIVE_WINDOW_POLL_SECONDS
+    return min(
+        max(retry_after, NO_ACTIVE_WINDOW_POLL_SECONDS),
+        float(POLL_INTERVAL_SECONDS),
+    )
+
+
+def _policy_token_logprobs(
+    logits,
+    tokens: list[int],
+    positions: list[int],
+    *,
+    workspace_bytes: int = _LOGPROB_WORKSPACE_BYTES,
+) -> list[float]:
+    """fp32 log-prob of ``tokens[i]`` under ``logits[i - 1]`` for each position.
+
+    ``log_softmax`` is row-independent, so selecting the needed rows before
+    the fp32 cast gives the same values as a full-sequence ``log_softmax``
+    (the validator also selects rows first). One host transfer per chunk
+    replaces a device sync per token.
+    """
+    import torch
+
+    if not positions:
+        return []
+    device = logits.device
+    rows = torch.tensor([p - 1 for p in positions], device=device, dtype=torch.long)
+    targets = torch.tensor(
+        [tokens[p] for p in positions], device=device, dtype=torch.long,
+    )
+    vocab = max(1, int(logits.shape[-1]))
+    chunk = max(1, int(workspace_bytes) // (vocab * 4))
+    out: list[float] = []
+    for start in range(0, len(positions), chunk):
+        selected = logits.index_select(0, rows[start:start + chunk]).float()
+        chosen = torch.log_softmax(selected, dim=-1).gather(
+            1, targets[start:start + chunk].unsqueeze(1),
+        )
+        out.extend(chosen.squeeze(1).tolist())
+    return out
+
+
+def _population_sigma(rewards: list[float]) -> float:
+    mean = sum(rewards) / len(rewards)
+    return (sum((r - mean) ** 2 for r in rewards) / len(rewards)) ** 0.5
+
+
+def _local_zone_skip_reason(
+    *,
+    env_name: str,
+    rewards: list[float],
+    completions: list[list[int]],
+    texts: list[str],
+    eos_ids,
+) -> str | None:
+    """Why admission would refuse this locally-scored group before proof.
+
+    Mirrors the validator's pre-proof gates for single-turn environments whose
+    reward the miner computes: the truncation allowance, a malformed final
+    answer box, then the sigma gate with truncated and unboxed rollouts valued
+    at every attainable reward. Returns ``None`` when the group is worth
+    proving.
+    """
+    from reliquary.constants import (
+        MATH_ANSWER_FORMAT,
+        MAX_TRUNCATED_PER_SUBMISSION,
+        MAX_TRUNCATED_PER_SUBMISSION_BY_ENV,
+        ROBUST_TRUNCATION_UTILITY_ENABLED,
+        SIGMA_MIN,
+    )
+    from reliquary.validator.boxed_integrity import (
+        has_malformed_final_answer,
+        is_missing_final_answer_box,
+    )
+    from reliquary.validator.difficulty_auction import (
+        robust_uncertain_reward_utility,
+    )
+
+    if len(rewards) < 2:
+        return "too_few_rollouts"
+    spec = get_environment_spec(env_name)
+    eos = {int(t) for t in eos_ids}
+    truncated = [
+        index for index, completion in enumerate(completions)
+        if not any(int(t) in eos for t in completion)
+    ]
+    allowance = MAX_TRUNCATED_PER_SUBMISSION_BY_ENV.get(
+        env_name, MAX_TRUNCATED_PER_SUBMISSION,
+    )
+    if len(truncated) > allowance:
+        return "too_many_truncated"
+    boxed_policy = spec.final_answer_policy == "boxed"
+    if boxed_policy and any(
+        has_malformed_final_answer(reward, text)[0]
+        for reward, text in zip(rewards, texts)
+    ):
+        return "malformed_final_answer"
+    unboxed = (
+        [index for index, text in enumerate(texts) if is_missing_final_answer_box(text)]
+        if boxed_policy and MATH_ANSWER_FORMAT == "boxed"
+        else []
+    )
+    uncertain = list(dict.fromkeys([*truncated, *unboxed]))
+    if ROBUST_TRUNCATION_UTILITY_ENABLED and uncertain:
+        in_zone = robust_uncertain_reward_utility(
+            rewards,
+            sigma_min=SIGMA_MIN,
+            uncertain_indices=uncertain,
+            attainable_rewards=spec.attainable_rewards,
+        ) > 0.0
+    else:
+        sigma = _population_sigma(rewards)
+        in_zone = sigma >= 1e-8 and sigma >= SIGMA_MIN
+    return None if in_zone else "out_of_zone"
+
+
+def _prefix_screen_reason(
+    *,
+    env_name: str,
+    rewards: list[float],
+    completions: list[list[int]],
+    texts: list[str],
+    eos_ids,
+    max_new_tokens: int,
+) -> str | None:
+    """Whether the first forced rollouts are worth finishing.
+
+    ``None`` means generate the tail. A hard admission failure is already
+    decisive. A long prefix with no clean correct/wrong pair is not: the
+    tokens still to generate are unlikely to clear the zone cheaply.
+    """
+    from reliquary.constants import MATH_ANSWER_FORMAT
+    from reliquary.validator.boxed_integrity import is_missing_final_answer_box
+
+    hard = _local_zone_skip_reason(
+        env_name=env_name,
+        rewards=rewards,
+        completions=completions,
+        texts=texts,
+        eos_ids=eos_ids,
+    )
+    if hard in {"too_many_truncated", "malformed_final_answer"}:
+        return hard
+    spec = get_environment_spec(env_name)
+    eos = {int(token) for token in eos_ids}
+    truncated = {
+        index for index, completion in enumerate(completions)
+        if not any(int(token) in eos for token in completion)
+    }
+    unboxed = set()
+    if spec.final_answer_policy == "boxed" and MATH_ANSWER_FORMAT == "boxed":
+        unboxed = {
+            index for index, text in enumerate(texts)
+            if is_missing_final_answer_box(text)
+        }
+    uncertain = truncated | unboxed
+    correct = any(
+        index not in uncertain and rewards[index] >= 0.5
+        for index in range(len(rewards))
+    )
+    wrong = any(
+        index not in uncertain and rewards[index] < 0.5
+        for index in range(len(rewards))
+    )
+    if correct and wrong:
+        return None
+    mean_length = sum(len(completion) for completion in completions) / len(completions)
+    long = bool(truncated) or (
+        max_new_tokens > 0
+        and mean_length >= ZONE_SCREEN_LONG_FRACTION * max_new_tokens
+    )
+    if long:
+        return "expensive_extreme"
+    return None
+
+
+class AttemptedPromptJournal:
+    """Prompts already drawn for one window, so a restart cannot redraw them.
+
+    The forced stream is fixed by randomness, prompt and checkpoint, and the
+    validator rejects that token content for the dedup horizon. The record is
+    replaced when any of those three change.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def load(
+        self, *, window_n: int, randomness: str, checkpoint_hash: str,
+    ) -> dict[str, set[int]] | None:
+        if not self.path.exists():
+            return None
+        record = json.loads(self.path.read_text())
+        if (
+            record.get("window_n") != window_n
+            or record.get("randomness") != randomness
+            or record.get("checkpoint_hash") != checkpoint_hash
+        ):
+            return None
+        return {
+            str(name): {int(prompt) for prompt in prompts}
+            for name, prompts in record.get("prompts", {}).items()
+        }
+
+    def save(
+        self,
+        *,
+        window_n: int,
+        randomness: str,
+        checkpoint_hash: str,
+        attempted: dict[str, set[int]],
+    ) -> None:
+        payload = {
+            "window_n": window_n,
+            "randomness": randomness,
+            "checkpoint_hash": checkpoint_hash,
+            "prompts": {
+                name: sorted(prompts) for name, prompts in attempted.items()
+            },
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True))
+        os.replace(temporary, self.path)
+
+
+def _attempt_journal_path(wallet_address: str) -> Path:
+    identity = default_checkpoint_identity_path(wallet_address)
+    name = identity.name
+    if name.startswith("checkpoint-"):
+        name = "attempted-" + name[len("checkpoint-"):]
+    else:
+        name = "attempted-" + name
+    return identity.with_name(name)
 
 
 def _eligible_generation_mix(
@@ -559,13 +822,15 @@ class MiningEngine:
         window_number: int,
         checkpoint_revision: str,
         runtime_fingerprint=None,
+        rewards: list[float] | None = None,
     ):
         """Turn backend-produced token sequences into a protocol request.
 
         Generation backends only need to return the same small generation
         dictionaries as the built-in path. Proof construction, token
         log-probabilities, rewards, signatures, and request formatting remain
-        on the existing canonical implementation.
+        on the existing canonical implementation. ``rewards``, when given, are
+        the values ``_score_generations`` already computed for this group.
         """
         from reliquary.protocol.submission import BatchSubmissionRequest
 
@@ -573,14 +838,17 @@ class MiningEngine:
             raise ValueError(
                 f"expected {M_ROLLOUTS} generations, got {len(generations)}"
             )
+        if rewards is not None and len(rewards) != len(generations):
+            raise ValueError("rewards must align with generations")
         rollouts = [
             self._build_rollout_submission(
                 generation,
                 problem,
                 randomness,
                 env=environment,
+                reward=None if rewards is None else rewards[index],
             )
-            for generation in generations
+            for index, generation in enumerate(generations)
         ]
         return BatchSubmissionRequest(
             miner_hotkey=self.wallet.hotkey.ss58_address,
@@ -617,6 +885,7 @@ class MiningEngine:
         from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
             EndpointNotFoundError,
+            NoActiveWindowError,
             SubmissionError,
             discover_validator_url,
             get_miner_state_v1,
@@ -674,6 +943,14 @@ class MiningEngine:
         miner_state_etag: str | None = None
         legacy_cooldown_window: int | None = None
         prompt_ranges: dict[str, tuple[int, int]] = {}
+        # The forced draw is fixed per (window randomness, prompt, checkpoint),
+        # so a prompt already generated this window can only reproduce the
+        # same tokens: never pick it again, whatever happened to it.
+        attempted_key: tuple[int, str, str] | None = None
+        attempted: dict[str, set[int]] = {name: set() for name in self.envs}
+        attempt_journal = AttemptedPromptJournal(
+            _attempt_journal_path(self.wallet.hotkey.ss58_address)
+        )
 
         submitted = asyncio.Event()
         async with (
@@ -750,8 +1027,10 @@ class MiningEngine:
                             )
                     else:
                         state = await get_window_state_v2(url, client=client)
+                except NoActiveWindowError as exc:
+                    await asyncio.sleep(_no_active_window_delay(exc))
+                    continue
                 except SubmissionError:
-                    # /state may return 503 between windows; wait briefly.
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
                 except Exception as e:
@@ -908,11 +1187,34 @@ class MiningEngine:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
+                window_key = (state.window_n, randomness, local_hash)
+                if window_key != attempted_key:
+                    attempted_key = window_key
+                    attempted = {name: set() for name in self.envs}
+                    try:
+                        restored = attempt_journal.load(
+                            window_n=state.window_n,
+                            randomness=randomness,
+                            checkpoint_hash=local_hash,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "could not read the attempted-prompt journal",
+                            exc_info=True,
+                        )
+                        restored = None
+                    if restored:
+                        for name, prompts in restored.items():
+                            attempted.setdefault(name, set()).update(prompts)
+                excluded = {
+                    name: self._cooldown_per_env.get(name, set()) | attempted[name]
+                    for name in self.envs
+                }
                 try:
                     env_name, prompt_idx = pick_env_and_prompt(
                         self.envs,
                         generation_mix,
-                        self._cooldown_per_env,
+                        excluded,
                         rng=rng,
                         randomness=randomness,
                         prompt_ranges=prompt_ranges or None,
@@ -921,6 +1223,19 @@ class MiningEngine:
                     logger.info("all envs fully in cooldown; sleeping")
                     await asyncio.sleep(5)
                     continue
+                attempted[env_name].add(prompt_idx)
+                try:
+                    attempt_journal.save(
+                        window_n=state.window_n,
+                        randomness=randomness,
+                        checkpoint_hash=local_hash,
+                        attempted=attempted,
+                    )
+                except Exception:
+                    logger.warning(
+                        "could not record attempted prompt %s/%d",
+                        env_name, prompt_idx, exc_info=True,
+                    )
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
@@ -932,6 +1247,19 @@ class MiningEngine:
                         prompt_idx=prompt_idx,
                         checkpoint_hash=local_hash,
                     )
+                elif self._local_zone_filter_applies(env_name, env):
+                    generations, screen_reason = self._generate_zone_screened_rollouts(
+                        problem, randomness, env_name=env_name,
+                        prompt_idx=prompt_idx, checkpoint_hash=local_hash,
+                        env=env,
+                    )
+                    if screen_reason is not None:
+                        logger.info(
+                            "skipping before the tail: reason=%s window=%d "
+                            "env=%s prompt=%d",
+                            screen_reason, state.window_n, env_name, prompt_idx,
+                        )
+                        continue
                 else:
                     generations = self._generate_m_rollouts(
                         problem, randomness, env_name=env_name,
@@ -944,6 +1272,32 @@ class MiningEngine:
                     )
                     continue
 
+                local_rewards = None
+                if self._local_zone_filter_applies(env_name, env):
+                    from reliquary.shared.modeling import resolve_eos_token_ids
+
+                    completions, texts, local_rewards = self._score_generations(
+                        env, problem, generations,
+                    )
+                    skip_reason = _local_zone_skip_reason(
+                        env_name=env_name,
+                        rewards=local_rewards,
+                        completions=completions,
+                        texts=texts,
+                        eos_ids=resolve_eos_token_ids(
+                            self.vllm_model, self.tokenizer,
+                        ),
+                    )
+                    if skip_reason is not None:
+                        logger.info(
+                            "skipping proof: reason=%s window=%d env=%s "
+                            "prompt=%d correct=%d/%d",
+                            skip_reason, state.window_n, env_name, prompt_idx,
+                            sum(1 for r in local_rewards if r >= 0.5),
+                            len(local_rewards),
+                        )
+                        continue
+
                 request = self.build_batch_request_from_generations(
                     generations=generations,
                     problem=problem,
@@ -953,6 +1307,7 @@ class MiningEngine:
                     window_number=state.window_n,
                     checkpoint_revision=local_hash,
                     runtime_fingerprint=runtime_fingerprint,
+                    rewards=local_rewards,
                 )
 
                 # Generation and proof construction can span a state
@@ -1153,9 +1508,55 @@ class MiningEngine:
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
 
+    def _generate_zone_screened_rollouts(
+        self, problem, randomness, *, env_name: str, prompt_idx: int,
+        checkpoint_hash: str, env,
+    ) -> tuple[list[dict] | None, str | None]:
+        """Finish a Math group only when its forced prefix is worth proving.
+
+        Rollouts ``0 .. ZONE_SCREEN_ROLLOUTS-1`` are the same forced draws a
+        full group would have produced. The tail uses the remaining indices,
+        so the submitted group is the protocol group, not a second sample.
+        """
+        from reliquary.constants import max_new_tokens_for_environment
+        from reliquary.shared.modeling import resolve_eos_token_ids
+
+        prefix_count = min(ZONE_SCREEN_ROLLOUTS, M_ROLLOUTS)
+        if prefix_count >= M_ROLLOUTS:
+            return self._generate_m_rollouts(
+                problem, randomness, env_name=env_name, prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash,
+            ), None
+        prefix = self._generate_m_rollouts(
+            problem, randomness, env_name=env_name, prompt_idx=prompt_idx,
+            checkpoint_hash=checkpoint_hash,
+            rollout_indices=list(range(prefix_count)),
+        )
+        completions, texts, rewards = self._score_generations(env, problem, prefix)
+        reason = _prefix_screen_reason(
+            env_name=env_name,
+            rewards=rewards,
+            completions=completions,
+            texts=texts,
+            eos_ids=resolve_eos_token_ids(self.vllm_model, self.tokenizer),
+            max_new_tokens=min(
+                int(self.max_new_tokens),
+                max_new_tokens_for_environment(env_name),
+            ),
+        )
+        if reason is not None:
+            return None, reason
+        tail = self._generate_m_rollouts(
+            problem, randomness, env_name=env_name, prompt_idx=prompt_idx,
+            checkpoint_hash=checkpoint_hash,
+            rollout_indices=list(range(prefix_count, M_ROLLOUTS)),
+        )
+        return prefix + tail, None
+
     def _generate_m_rollouts(
         self, problem, randomness, *, env_name: str | None = None,
         prompt_idx: int, checkpoint_hash: str,
+        rollout_indices: list[int] | None = None,
     ) -> list[dict]:
         """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
 
@@ -1228,6 +1629,14 @@ class MiningEngine:
             except ValueError:
                 bft_applicable = False
 
+        indices = (
+            list(range(M_ROLLOUTS)) if rollout_indices is None else list(rollout_indices)
+        )
+        if not indices:
+            return []
+        if bft_applicable and rollout_indices is not None:
+            raise RuntimeError("BFT generation does not screen a rollout prefix")
+
         generator = getattr(self, "generator", None)
         if generator is not None and not bft_applicable:
             completions = generator.generate(
@@ -1235,9 +1644,10 @@ class MiningEngine:
                 randomness=randomness,
                 prompt_idx=prompt_idx,
                 checkpoint_hash=checkpoint_hash,
-                rollouts=M_ROLLOUTS,
+                rollouts=len(indices),
                 max_new_tokens=environment_cap,
                 eos_ids=sorted(eos_ids),
+                rollout_indices=indices,
             )
             return [
                 {
@@ -1250,7 +1660,7 @@ class MiningEngine:
 
         with torch.no_grad():
             input_tensor = torch.tensor(
-                [prompt_tokens] * M_ROLLOUTS,
+                [prompt_tokens] * len(indices),
                 device=getattr(self.vllm_model, "device", "cpu"),
             )
             attention_mask = torch.ones_like(input_tensor)
@@ -1272,8 +1682,8 @@ class MiningEngine:
             phase1_proc = ForcedSeedLogitsProcessor(
                 randomness=randomness, hotkey=hotkey, prompt_idx=prompt_idx,
                 checkpoint_hash=checkpoint_hash,
-                rollout_indices=list(range(M_ROLLOUTS)),
-                base_offsets=[0] * M_ROLLOUTS, start_len=prompt_length,
+                rollout_indices=indices,
+                base_offsets=[0] * len(indices), start_len=prompt_length,
             )
             outputs = self.vllm_model.generate(
                 input_tensor,
@@ -1302,8 +1712,8 @@ class MiningEngine:
                     gen_kwargs=phase2_kwargs,
                 )
         rollouts = []
-        for i in range(M_ROLLOUTS):
-            seq = outputs[i].tolist()
+        for row in range(len(indices)):
+            seq = outputs[row].tolist()
             gen = seq[prompt_length:]
             first_eos = first_eos_index(gen, eos_ids)
             if first_eos is not None:
@@ -1378,20 +1788,51 @@ class MiningEngine:
             })
         return generations
 
-    def _build_rollout_submission(self, generation, problem, randomness, *, env=None):
+    def _local_zone_filter_applies(self, env_name: str, env) -> bool:
+        from reliquary.constants import BFT_ENABLED, MINER_LOCAL_ZONE_FILTER
+
+        if not MINER_LOCAL_ZONE_FILTER or BFT_ENABLED:
+            return False
+        if getattr(env, "validator_authoritative_reward", False):
+            return False
+        try:
+            spec = get_environment_spec(env_name)
+        except ValueError:
+            return False
+        return (
+            not spec.validator_authoritative_reward
+            and spec.interaction_mode == "single_turn"
+        )
+
+    def _score_generations(self, env, problem, generations: list[dict]):
+        """Completion tokens, decoded texts and local rewards, one per rollout.
+
+        Decoding and scoring match ``_build_rollout_submission`` exactly, so
+        these rewards are the claims that would be submitted.
+        """
+        completions = [
+            list(g["tokens"][g["prompt_length"]:]) for g in generations
+        ]
+        texts = [self.tokenizer.decode(c) for c in completions]
+        rewards = [float(env.compute_reward(problem, t)) for t in texts]
+        return completions, texts, rewards
+
+    def _build_rollout_submission(
+        self, generation, problem, randomness, *, env=None, reward=None,
+    ):
         """Build a RolloutSubmission: completion + claimed reward + GRAIL commit."""
         active_env = env if env is not None else self.env
         all_tokens = generation["tokens"]
         prompt_length = generation["prompt_length"]
         if generation.get("trace") is not None:
             reward = 0.0
+        elif getattr(active_env, "validator_authoritative_reward", False):
+            reward = 0.0
+        elif reward is not None:
+            reward = float(reward)
         else:
-            completion_tokens = all_tokens[prompt_length:]
-            completion_text = self.tokenizer.decode(completion_tokens)
-            if getattr(active_env, "validator_authoritative_reward", False):
-                reward = 0.0
-            else:
-                reward = active_env.compute_reward(problem, completion_text)
+            completion_text = self.tokenizer.decode(all_tokens[prompt_length:])
+            reward = active_env.compute_reward(problem, completion_text)
 
         commit = self._build_grail_commit(generation, randomness)
         return RolloutSubmission(
@@ -1444,8 +1885,6 @@ class MiningEngine:
         r_vec = self._verifier.generate_r_vec(randomness)
         commitments = self._verifier.create_commitments_batch(hidden_states, r_vec)
 
-        # fp32 log_softmax to match the validator and reduce tail-token drift.
-        log_probs = torch.log_softmax(logits[0].float(), dim=-1)
         trace = generation.get("trace")
         policy_positions = (
             [
@@ -1456,9 +1895,11 @@ class MiningEngine:
             if trace is not None
             else list(range(prompt_length, len(all_tokens)))
         )
-        token_logprobs: list[float] = []
-        for i in policy_positions:
-            token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())
+        # fp32 log_softmax to match the validator and reduce tail-token drift.
+        token_logprobs = _policy_token_logprobs(
+            logits[0], all_tokens, policy_positions,
+        )
+        del logits
 
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
         rollout_metadata = _rollout_metadata(generation, token_logprobs)

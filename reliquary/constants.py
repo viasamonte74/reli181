@@ -1538,6 +1538,12 @@ if MINER_GENERATION_BACKEND not in ("transformers", "vllm"):
 MINER_VLLM_MAX_NUM_SEQS = int(
     _os.environ.get("RELIQUARY_MINER_VLLM_MAX_NUM_SEQS", "256")
 )
+# Miner-local only: score locally-rewarded groups against the validator's
+# pre-proof gates and skip GRAIL proof construction for groups admission would
+# refuse. Never changes what is submitted, only whether it is.
+MINER_LOCAL_ZONE_FILTER = _os.environ.get(
+    "RELIQUARY_MINER_LOCAL_ZONE_FILTER", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 
 
 PPO_CLIP_EPSILON_LOW = 0.2

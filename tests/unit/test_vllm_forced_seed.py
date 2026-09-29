@@ -176,6 +176,20 @@ def test_every_rollout_asks_for_its_own_stream():
     assert all(p.max_tokens == 8 for p in sampling)
 
 
+def test_rollout_indices_select_the_forced_stream():
+    engine = _FakeEngine([[1], [2]])
+    generator = VLLMRolloutGenerator(
+        "model", engine=engine, sampling_params_class=_FakeParams)
+
+    generator.generate(
+        [5, 6], randomness=RANDOMNESS, prompt_idx=42, checkpoint_hash=CHECKPOINT,
+        rollouts=2, max_new_tokens=8, eos_ids=[99], rollout_indices=[4, 5],
+    )
+
+    forced = [p.extra_args["forced_seed"] for p in engine.seen[1]]
+    assert [f["rollout_index"] for f in forced] == [4, 5]
+
+
 def test_the_engine_is_only_built_when_none_is_supplied():
     with pytest.raises(ImportError):
         VLLMRolloutGenerator("model")

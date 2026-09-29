@@ -71,6 +71,10 @@ class EndpointNotFoundError(SubmissionError):
     """An optional or versioned validator capability is unavailable."""
 
 
+class NoActiveWindowError(SubmissionError):
+    """The validator answered 503: it is between windows, not failing."""
+
+
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -201,7 +205,7 @@ async def _get_with_retry(
                     f" retry_after={retry_after}"
                     if retry_after is not None else ""
                 )
-                raise SubmissionError(
+                raise NoActiveWindowError(
                     f"no active window at {full_url}{suffix}", retry_after=retry_after
                 )
             if resp.status_code == 404:
@@ -575,8 +579,9 @@ async def get_miner_state_v1(
                     f"endpoint unavailable: {url}/miner-state"
                 )
             if response.status_code == 503:
-                raise SubmissionError(
-                    f"no active window at {url}/miner-state"
+                raise NoActiveWindowError(
+                    f"no active window at {url}/miner-state",
+                    retry_after=_retry_after_seconds(response),
                 )
             if response.status_code >= 400:
                 last_exc = SubmissionError(
