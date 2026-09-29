@@ -174,6 +174,7 @@ def test_every_rollout_asks_for_its_own_stream():
     assert {f["prompt_idx"] for f in forced} == {42}
     assert all(p.temperature == 0.0 for p in sampling)
     assert all(p.max_tokens == 8 for p in sampling)
+    assert all(p.ignore_eos is True for p in sampling)
 
 
 def test_rollout_indices_select_the_forced_stream():
@@ -188,6 +189,52 @@ def test_rollout_indices_select_the_forced_stream():
 
     forced = [p.extra_args["forced_seed"] for p in engine.seen[1]]
     assert [f["rollout_index"] for f in forced] == [4, 5]
+
+
+def test_reload_swaps_weights_without_rebuilding():
+    class _Live:
+        def __init__(self):
+            self.calls = []
+
+        def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+            self.calls.append((method, args))
+
+        def reset_prefix_cache(self, device=None):
+            self.calls.append(("reset_prefix_cache", ()))
+
+    engine = _Live()
+    generator = VLLMRolloutGenerator(
+        "old", engine=engine, sampling_params_class=_FakeParams,
+    )
+
+    generator.reload("/snapshots/next", revision="abc")
+
+    assert generator._llm is engine
+    assert generator.model_path == "/snapshots/next"
+    assert generator.revision == "abc"
+    assert [call[0] for call in engine.calls] == [
+        "update_config", "reload_weights", "reset_prefix_cache",
+    ]
+    assert engine.calls[0][1] == (
+        {"model_config": {"model": "/snapshots/next", "revision": "abc"}},
+    )
+
+
+def test_reload_rebuilds_when_the_swap_fails():
+    class _Dead:
+        def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+            raise RuntimeError("rpc failed")
+
+    built = object()
+    generator = VLLMRolloutGenerator(
+        "old", engine=_Dead(), sampling_params_class=_FakeParams,
+    )
+    generator._build = lambda path, revision: built
+
+    generator.reload("/snapshots/next")
+
+    assert generator._llm is built
+    assert generator.model_path == "/snapshots/next"
 
 
 def test_the_engine_is_only_built_when_none_is_supplied(monkeypatch):

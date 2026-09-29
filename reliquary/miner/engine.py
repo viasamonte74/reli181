@@ -254,6 +254,127 @@ def _prefix_screen_reason(
     return None
 
 
+def _structural_termination_kind(
+    tokens: list[int],
+    prompt_length: int,
+    eos_ids,
+    cap: int,
+) -> str:
+    """Admission-shaped termination, before any proof forward.
+
+    ``eos`` is a single trailing stop and still has to match the forced
+    pick. ``truncated`` reached the protocol cap with no stop. Anything
+    else is ``bad_termination``.
+    """
+    completion = list(tokens)[int(prompt_length):]
+    if not completion:
+        return "bad_termination"
+    eos = {int(token) for token in eos_ids}
+    positions = [
+        index for index, token in enumerate(completion) if int(token) in eos
+    ]
+    if positions:
+        if len(positions) != 1 or positions[0] != len(completion) - 1:
+            return "bad_termination"
+        return "eos"
+    total = int(prompt_length) + len(completion)
+    if total >= int(cap):
+        return "truncated"
+    return "bad_termination"
+
+
+def _termination_upload_skip_reason(
+    env_name: str, kinds: list[str | None],
+) -> str | None:
+    """Why this group must not be uploaded.
+
+    ``None`` means submit. An unclassified rollout fails open: a screen
+    bug must not drop a group the validator might have paid.
+    """
+    from reliquary.constants import max_truncated_for_environment
+
+    if not kinds:
+        return None
+    for kind in kinds:
+        if kind in {"bad_termination", "token_tampered"}:
+            return kind
+    if any(kind is None for kind in kinds):
+        return None
+    truncated = sum(kind == "truncated" for kind in kinds)
+    if truncated > max_truncated_for_environment(env_name):
+        return "too_many_truncated"
+    return None
+
+
+def _proof_termination_kind(
+    *,
+    tokens: list[int],
+    prompt_length: int,
+    eos_ids,
+    cap: int,
+    logits,
+    randomness: str,
+    prompt_idx: int,
+    checkpoint_hash: str,
+    rollout_index: int,
+    token_logprobs: list[float],
+) -> str:
+    """Termination the validator's proof will assign to one rollout.
+
+    Uses the proof model's logits, which is the forward the validator
+    repeats. A vLLM stop that is not that forward's forced pick is
+    ``bad_termination`` and must not be uploaded.
+    """
+    import math
+
+    from reliquary.constants import (
+        FORCED_SEED_ENFORCE,
+        MIN_EOS_PROBABILITY,
+        PROTOCOL_VERSION,
+        TOKEN_AUTH_THRESHOLD,
+    )
+    from reliquary.environment.forced_sampling import u_at
+    from reliquary.validator.verifier import (
+        _forced_pick_diagnostics,
+        _gpu_p_stop,
+    )
+
+    kind = _structural_termination_kind(tokens, prompt_length, eos_ids, cap)
+    if kind == "bad_termination":
+        return kind
+    if token_logprobs and any(
+        lp < math.log(TOKEN_AUTH_THRESHOLD) for lp in token_logprobs
+    ):
+        return "token_tampered"
+    if kind != "eos":
+        return kind
+    if len(tokens) < 2:
+        return "bad_termination"
+    eos = {int(token) for token in eos_ids}
+    completion_length = len(tokens) - int(prompt_length)
+    forced, _miss = _forced_pick_diagnostics(
+        logits[len(tokens) - 2],
+        int(tokens[-1]),
+        u_at(
+            randomness, prompt_idx, checkpoint_hash, rollout_index,
+            completion_length - 1,
+        ),
+    )
+    require_forced = PROTOCOL_VERSION == 6 and FORCED_SEED_ENFORCE
+    if require_forced:
+        eos_ok = bool(forced)
+    else:
+        p_stop = _gpu_p_stop(logits, len(tokens), eos, logits.device)
+        eos_ok = bool(forced) or (
+            p_stop is not None and p_stop >= MIN_EOS_PROBABILITY
+        )
+    if eos_ok:
+        return "ok"
+    if int(prompt_length) + completion_length >= int(cap):
+        return "truncated"
+    return "bad_termination"
+
+
 class AttemptedPromptJournal:
     """Prompts already drawn for one window, so a restart cannot redraw them.
 
@@ -1289,6 +1410,13 @@ class MiningEngine:
                             code_skip, state.window_n, env_name, prompt_idx,
                         )
                         continue
+                    if getattr(self, "generator", None) is not None:
+                        for index, generation in enumerate(generations):
+                            generation["screen_termination"] = True
+                            generation["rollout_index"] = index
+                            generation["prompt_idx"] = prompt_idx
+                            generation["checkpoint_hash"] = local_hash
+                            generation["env_name"] = env_name
 
                 local_rewards = None
                 if self._local_zone_filter_applies(env_name, env):
@@ -1327,6 +1455,18 @@ class MiningEngine:
                     runtime_fingerprint=runtime_fingerprint,
                     rewards=local_rewards,
                 )
+                if env_name == "opencodeinstruct":
+                    upload_skip = _termination_upload_skip_reason(
+                        env_name,
+                        [g.get("termination_kind") for g in generations],
+                    )
+                    if upload_skip is not None:
+                        logger.info(
+                            "skipping upload: reason=%s window=%d env=%s "
+                            "prompt=%d",
+                            upload_skip, state.window_n, env_name, prompt_idx,
+                        )
+                        continue
 
                 # Generation and proof construction can span a state
                 # transition. Re-read the exact live lane immediately before
@@ -1827,6 +1967,23 @@ class MiningEngine:
         from reliquary.shared.modeling import resolve_eos_token_ids
 
         try:
+            from reliquary.constants import max_new_tokens_for_environment
+
+            eos_ids = resolve_eos_token_ids(self.vllm_model, self.tokenizer)
+            cap = max_new_tokens_for_environment("opencodeinstruct")
+            for generation in generations:
+                generation["termination_kind"] = _structural_termination_kind(
+                    list(generation["tokens"]),
+                    int(generation["prompt_length"]),
+                    eos_ids,
+                    cap,
+                )
+            structural = _termination_upload_skip_reason(
+                "opencodeinstruct",
+                [generation["termination_kind"] for generation in generations],
+            )
+            if structural is not None:
+                return structural
             cases = list(env.admission_reward_cases(problem) or [])
             if not cases:
                 return None
@@ -1846,7 +2003,7 @@ class MiningEngine:
                 rewards=rewards,
                 completions=completions,
                 texts=texts,
-                eos_ids=resolve_eos_token_ids(self.vllm_model, self.tokenizer),
+                eos_ids=eos_ids,
             )
         except Exception:
             logger.warning("code zone screen failed; submitting the group", exc_info=True)
@@ -1963,6 +2120,31 @@ class MiningEngine:
         token_logprobs = _policy_token_logprobs(
             logits[0], all_tokens, policy_positions,
         )
+        if generation.get("screen_termination"):
+            try:
+                from reliquary.constants import max_new_tokens_for_environment
+                from reliquary.shared.modeling import resolve_eos_token_ids
+
+                generation["termination_kind"] = _proof_termination_kind(
+                    tokens=all_tokens,
+                    prompt_length=prompt_length,
+                    eos_ids=resolve_eos_token_ids(self.hf_model, self.tokenizer),
+                    cap=max_new_tokens_for_environment(
+                        str(generation.get("env_name") or "opencodeinstruct"),
+                    ),
+                    logits=logits[0],
+                    randomness=randomness,
+                    prompt_idx=int(generation["prompt_idx"]),
+                    checkpoint_hash=str(generation["checkpoint_hash"]),
+                    rollout_index=int(generation["rollout_index"]),
+                    token_logprobs=token_logprobs,
+                )
+            except Exception:
+                logger.warning(
+                    "code termination screen failed; submitting the group",
+                    exc_info=True,
+                )
+                generation["termination_kind"] = None
         del logits
 
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")

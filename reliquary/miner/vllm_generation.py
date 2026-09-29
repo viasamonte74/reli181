@@ -147,8 +147,8 @@ def forced_seed_extra_args(
 class VLLMRolloutGenerator:
     """A group of rollouts for one prompt, generated concurrently on vLLM.
 
-    The engine is built once and reused; a checkpoint change rebuilds it, since
-    vLLM holds its weights for the process's life.
+    The engine is built once. A later checkpoint of the same architecture
+    swaps weights in place; the compiled graphs and KV cache stay up.
     """
 
     def __init__(
@@ -186,15 +186,46 @@ class VLLMRolloutGenerator:
         return engine
 
     def reload(self, model_path: str, revision: str | None = None) -> None:
-        """Point the generator at new weights.
+        """Point the generator at new weights of the same architecture.
 
-        vLLM holds its weights for the engine's life, so this rebuilds it. That
-        costs a model load per checkpoint, which is why the miner pulls a
-        checkpoint between windows rather than during one.
+        ``reload_weights`` writes the new snapshot into the live parameters.
+        A failed swap rebuilds the engine, which is the slow path this avoids
+        on the common checkpoint change.
         """
-        del self._llm
+        if self._llm is None:
+            self.model_path, self.revision = model_path, revision
+            self._llm = self._build(model_path, revision)
+            return
+        try:
+            self._swap_weights(model_path, revision)
+        except Exception:
+            logger.exception(
+                "in-place vLLM weight reload failed; rebuilding the engine"
+            )
+            engine = self._llm
+            self._llm = None
+            del engine
+            self.model_path, self.revision = model_path, revision
+            self._llm = self._build(model_path, revision)
+            return
         self.model_path, self.revision = model_path, revision
-        self._llm = self._build(model_path, revision)
+        logger.info(
+            "vLLM weights reloaded in place (%s%s)",
+            model_path, f"@{revision}" if revision else "",
+        )
+
+    def _swap_weights(self, model_path: str, revision: str | None) -> None:
+        model_config = {"model": model_path}
+        if revision is not None:
+            model_config["revision"] = revision
+        # The worker re-reads ``model_config.model`` inside ``reload_weights``.
+        # The parent's engine object keeps the old path; only the worker loads.
+        self._llm.collective_rpc(
+            "update_config", args=({"model_config": model_config},),
+        )
+        self._llm.collective_rpc("reload_weights")
+        # Cached prefixes were computed with the previous weights.
+        self._llm.reset_prefix_cache()
 
     def generate(
         self, prompt_tokens: list[int], *, randomness: str, prompt_idx: int,
@@ -218,6 +249,11 @@ class VLLMRolloutGenerator:
         sampling = [
             sampling_params(
                 temperature=0.0, max_tokens=int(max_new_tokens), detokenize=False,
+                # The checkpoint generation_config lists extra stop tokens.
+                # Stopping on one the protocol does not treat as EOS leaves a
+                # short completion the validator rejects as bad_termination.
+                # ``ignore_eos`` keeps only the protocol stop set below.
+                ignore_eos=True,
                 stop_token_ids=stop_ids or None,
                 extra_args=forced_seed_extra_args(
                     randomness=randomness, prompt_idx=prompt_idx,
