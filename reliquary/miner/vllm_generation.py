@@ -103,6 +103,27 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
         return forced
 
 
+def _install_transformers5_tokenizer_compat() -> None:
+    """vLLM 0.10 caches a tokenizer property transformers 5 removed.
+
+    ``all_special_tokens_extended`` used to keep AddedToken objects. The
+    string list ``all_special_tokens`` is what this engine actually reads.
+    """
+    import vllm.transformers_utils.tokenizer as tokenizer_mod
+
+    original = tokenizer_mod.get_cached_tokenizer
+    if getattr(original, "_reliquary_compat", False):
+        return
+
+    def get_cached_tokenizer(tokenizer):
+        if not hasattr(tokenizer, "all_special_tokens_extended"):
+            tokenizer.all_special_tokens_extended = list(tokenizer.all_special_tokens)
+        return original(tokenizer)
+
+    get_cached_tokenizer._reliquary_compat = True  # type: ignore[attr-defined]
+    tokenizer_mod.get_cached_tokenizer = get_cached_tokenizer
+
+
 def _slot_index(value: Any) -> int:
     return int(value[0] if isinstance(value, (tuple, list)) else value)
 
@@ -150,9 +171,13 @@ class VLLMRolloutGenerator:
     def _build(self, model_path: str, revision: str | None) -> Any:
         from vllm import LLM  # local import: optional dependency
 
+        _install_transformers5_tokenizer_compat()
+        settings = {
+            key: value for key, value in self._settings.items() if value is not None
+        }
         engine = LLM(
             model=model_path, revision=revision, dtype="bfloat16",
-            logits_processors=[ForcedSeedVLLMProcessor], **self._settings,
+            logits_processors=[ForcedSeedVLLMProcessor], **settings,
         )
         logger.info(
             "vLLM generation backend ready (%s%s)", model_path,

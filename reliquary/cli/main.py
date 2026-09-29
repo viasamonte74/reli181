@@ -1827,10 +1827,18 @@ def mine(
             # vLLM owns cuda:0, where the transformers generation copy also
             # sits; on a single-device box that copy is only read for its eos
             # ids and device, so the two coexist at a lower utilisation.
+            # Cap the context at the longest profile completion plus room for
+            # the prompt. The model default (32k) does not fit in the KV cache
+            # beside that proof copy.
+            max_new_tokens = max(
+                spec.max_new_tokens
+                for spec in ACTIVE_PROTOCOL_PROFILE.environments.values()
+            )
             generator = VLLMRolloutGenerator(
                 initial_path,
                 revision=base_load_kwargs.get("revision"),
                 max_num_seqs=MINER_VLLM_MAX_NUM_SEQS,
+                max_model_len=max_new_tokens + 8192,
                 gpu_memory_utilization=(
                     0.85 if proof_device != "cuda:0" else 0.6
                 ),

@@ -190,6 +190,14 @@ def test_rollout_indices_select_the_forced_stream():
     assert [f["rollout_index"] for f in forced] == [4, 5]
 
 
-def test_the_engine_is_only_built_when_none_is_supplied():
+def test_the_engine_is_only_built_when_none_is_supplied(monkeypatch):
+    real_import = __import__
+
+    def _blocked(name, *args, **kwargs):
+        if name == "vllm" or name.startswith("vllm."):
+            raise ImportError("vllm is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", _blocked)
     with pytest.raises(ImportError):
         VLLMRolloutGenerator("model")
