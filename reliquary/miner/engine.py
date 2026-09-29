@@ -318,17 +318,23 @@ def _eligible_generation_mix(
     mix: list[tuple[str, int]],
     miner_state,
 ) -> list[tuple[str, int]]:
-    """Remove lanes that already advertise closed admission."""
+    """Remove lanes that already advertise closed admission.
+
+    Open lanes are then weighted by how many admission slots they still
+    have. A lane with a handful of seats left is the one that closed under
+    this miner mid-generation; spending the GPU on the lane with room left
+    is what gets the next valid group through the door.
+    """
     if miner_state is None:
         return list(mix)
-    return [
-        (environment, weight)
-        for environment, weight in mix
-        if (
-            environment in miner_state.environments
-            and miner_state.environments[environment].accepting_submissions
-        )
-    ]
+    open_lanes = []
+    for environment, weight in mix:
+        lane = miner_state.environments.get(environment)
+        if lane is None or not lane.accepting_submissions:
+            continue
+        remaining = int(getattr(lane, "admission_remaining", 0) or 0)
+        open_lanes.append((environment, remaining if remaining > 0 else weight))
+    return open_lanes
 
 
 def _state_matches_active_protocol(state) -> bool:
@@ -1272,6 +1278,18 @@ class MiningEngine:
                     )
                     continue
 
+                if self._code_zone_screen_applies(env_name, env):
+                    code_skip = self._code_zone_screen_reason(
+                        env, problem, generations,
+                    )
+                    if code_skip is not None:
+                        logger.info(
+                            "skipping proof: reason=%s window=%d env=%s "
+                            "prompt=%d",
+                            code_skip, state.window_n, env_name, prompt_idx,
+                        )
+                        continue
+
                 local_rewards = None
                 if self._local_zone_filter_applies(env_name, env):
                     from reliquary.shared.modeling import resolve_eos_token_ids
@@ -1787,6 +1805,52 @@ class MiningEngine:
                 "renderer_id": renderer_id,
             })
         return generations
+
+    def _code_zone_screen_applies(self, env_name: str, env) -> bool:
+        """Code only. Math already has its own local zone screen.
+
+        The screen reads public cases and does not touch the submitted
+        reward, which stays the validator placeholder.
+        """
+        if env_name != "opencodeinstruct":
+            return False
+        return callable(getattr(env, "admission_reward_cases", None))
+
+    def _code_zone_screen_reason(self, env, problem, generations: list[dict]) -> str | None:
+        """``out_of_zone`` when every scored rollout agrees, else None.
+
+        None also means the score could not be trusted, in which case the
+        group is submitted unchanged.
+        """
+        from reliquary.environment.opencodeinstruct import _entry_function_name, _extract_python
+        from reliquary.miner.code_zone_screen import score_group
+        from reliquary.shared.modeling import resolve_eos_token_ids
+
+        try:
+            cases = list(env.admission_reward_cases(problem) or [])
+            if not cases:
+                return None
+            entry = _entry_function_name(cases)
+            codes = []
+            completions = []
+            for generation in generations:
+                completion = list(generation["tokens"][generation["prompt_length"]:])
+                completions.append(completion)
+                codes.append(_extract_python(self.tokenizer.decode(completion), entry_name=entry))
+            rewards = score_group(codes, cases)
+            if rewards is None or len(rewards) != len(generations):
+                return None
+            texts = [self.tokenizer.decode(completion) for completion in completions]
+            return _local_zone_skip_reason(
+                env_name="opencodeinstruct",
+                rewards=rewards,
+                completions=completions,
+                texts=texts,
+                eos_ids=resolve_eos_token_ids(self.vllm_model, self.tokenizer),
+            )
+        except Exception:
+            logger.warning("code zone screen failed; submitting the group", exc_info=True)
+            return None
 
     def _local_zone_filter_applies(self, env_name: str, env) -> bool:
         from reliquary.constants import BFT_ENABLED, MINER_LOCAL_ZONE_FILTER
