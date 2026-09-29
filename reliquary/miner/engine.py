@@ -1820,9 +1820,7 @@ class MiningEngine:
             self.vllm_model = new_gen
             del old_hf
             del old_gen
-            generator = getattr(self, "generator", None)
-            if generator is not None:
-                generator.reload(local_path)
+            self._set_generator_weights()
             self._loaded_checkpoint_path = local_path
             logger.info("Checkpoint %s loaded into both models", local_path)
             return self.hf_model
@@ -1863,12 +1861,26 @@ class MiningEngine:
         except Exception:
             pass
 
-        generator = getattr(self, "generator", None)
-        if generator is not None:
-            generator.reload(local_path)
+        self._set_generator_weights()
         self._loaded_checkpoint_path = local_path
         logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
+
+    def _set_generator_weights(self) -> None:
+        """Copy the freshly published proof weights into the vLLM engine.
+
+        The engine is never rebuilt, so a failed copy leaves it neither on the
+        old checkpoint nor the new one; only a restart gives a coherent pair.
+        """
+        generator = getattr(self, "generator", None)
+        if generator is None:
+            return
+        try:
+            generator.set_weights(self.hf_model.named_parameters())
+        except Exception as exc:
+            raise CheckpointActivationRestartRequired(
+                "vLLM weights could not be set in place"
+            ) from exc
 
     def _generate_zone_screened_rollouts(
         self, problem, randomness, *, env_name: str, prompt_idx: int,

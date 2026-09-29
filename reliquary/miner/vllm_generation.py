@@ -18,6 +18,9 @@ costs ~31 ms whatever the batch, so the win is concurrency, not the engine.
 from __future__ import annotations
 
 import logging
+import os
+import time
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -163,17 +166,38 @@ def forced_seed_extra_args(
     }
 
 
+def _load_weights_on_worker(worker: Any, weights: list[tuple[str, torch.Tensor]]) -> list[str]:
+    """Copy ``weights`` into the worker's live parameters; return any left unset.
+
+    vLLM's ``load_weights`` fuses q/k/v and gate/up into its stacked parameters
+    and writes with ``copy_``, so parameter storage (which the captured CUDA
+    graphs point at) never moves.
+    """
+    model = worker.model_runner.get_model()
+    device = next(model.parameters()).device
+    loaded = model.load_weights(
+        (name, tensor.to(device, non_blocking=True)) for name, tensor in weights
+    )
+    torch.cuda.synchronize(device)
+    expected = {name for name, _ in model.named_parameters()}
+    return sorted(expected - set(loaded or ()))
+
+
 class VLLMRolloutGenerator:
     """A group of rollouts for one prompt, generated concurrently on vLLM.
 
-    The engine is built once. A later checkpoint of the same architecture
-    swaps weights in place; the compiled graphs and KV cache stay up.
+    The engine is built once for the life of the process. Every checkpoint,
+    including the first when built with ``load_format="dummy"``, arrives through
+    :meth:`set_weights` from tensors the miner already holds, so compiled
+    graphs, the KV cache and the scheduler stay up and nothing is re-read from
+    disk.
     """
 
     def __init__(
         self, model_path: str, *, revision: str | None = None,
         max_model_len: int | None = None, gpu_memory_utilization: float = 0.85,
         max_num_seqs: int = 256, enforce_eager: bool = False,
+        load_format: str | None = None,
         engine: Any | None = None, sampling_params_class: Any | None = None,
     ) -> None:
         self.model_path = model_path
@@ -183,11 +207,16 @@ class VLLMRolloutGenerator:
             "gpu_memory_utilization": gpu_memory_utilization,
             "max_num_seqs": max_num_seqs,
             "enforce_eager": enforce_eager,
+            "load_format": load_format,
         }
         self._sampling_params_class = sampling_params_class
         self._llm = engine if engine is not None else self._build(model_path, revision)
 
     def _build(self, model_path: str, revision: str | None) -> Any:
+        # set_weights hands live CUDA tensors to the worker. With the engine
+        # core in a subprocess those would be pickled through ZMQ (~8 GB per
+        # checkpoint); in-process they are passed by reference.
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         from vllm import LLM  # local import: optional dependency
 
         _install_transformers5_tokenizer_compat()
@@ -204,47 +233,39 @@ class VLLMRolloutGenerator:
         )
         return engine
 
-    def reload(self, model_path: str, revision: str | None = None) -> None:
-        """Point the generator at new weights of the same architecture.
-
-        ``reload_weights`` writes the new snapshot into the live parameters.
-        A failed swap rebuilds the engine, which is the slow path this avoids
-        on the common checkpoint change.
-        """
-        if self._llm is None:
-            self.model_path, self.revision = model_path, revision
-            self._llm = self._build(model_path, revision)
-            return
-        try:
-            self._swap_weights(model_path, revision)
-        except Exception:
-            logger.exception(
-                "in-place vLLM weight reload failed; rebuilding the engine"
+    def _require_in_process_engine(self) -> None:
+        client = getattr(getattr(self._llm, "llm_engine", None), "engine_core", None)
+        if client is not None and type(client).__name__ != "InprocClient":
+            raise RuntimeError(
+                "vLLM engine core runs in a subprocess "
+                f"({type(client).__name__}); set_weights needs "
+                "VLLM_ENABLE_V1_MULTIPROCESSING=0"
             )
-            engine = self._llm
-            self._llm = None
-            del engine
-            self.model_path, self.revision = model_path, revision
-            self._llm = self._build(model_path, revision)
-            return
-        self.model_path, self.revision = model_path, revision
-        logger.info(
-            "vLLM weights reloaded in place (%s%s)",
-            model_path, f"@{revision}" if revision else "",
-        )
 
-    def _swap_weights(self, model_path: str, revision: str | None) -> None:
-        model_config = {"model": model_path}
-        if revision is not None:
-            model_config["revision"] = revision
-        # The worker re-reads ``model_config.model`` inside ``reload_weights``.
-        # The parent's engine object keeps the old path; only the worker loads.
-        self._llm.collective_rpc(
-            "update_config", args=({"model_config": model_config},),
-        )
-        self._llm.collective_rpc("reload_weights")
+    def set_weights(self, named_tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """Write a checkpoint's tensors into the running engine in place.
+
+        ``named_tensors`` uses Hugging Face parameter names (what
+        ``model.named_parameters()`` yields on the proof copy). Raises when any
+        vLLM parameter was not covered, since generating from a half-updated
+        model would produce proofs the validator rejects.
+        """
+        started = time.monotonic()
+        self._require_in_process_engine()
+        weights = [(name, tensor.detach()) for name, tensor in named_tensors]
+        results = self._llm.collective_rpc(_load_weights_on_worker, args=(weights,))
+        missing = sorted({name for result in results or () for name in result or ()})
+        if missing:
+            raise RuntimeError(
+                f"vLLM weight update left {len(missing)} parameters unset "
+                f"(first: {missing[:3]})"
+            )
         # Cached prefixes were computed with the previous weights.
         self._llm.reset_prefix_cache()
+        logger.info(
+            "vLLM weights set in place: %d tensors in %.2fs",
+            len(weights), time.monotonic() - started,
+        )
 
     def generate(
         self, prompt_tokens: list[int], *, randomness: str, prompt_idx: int,

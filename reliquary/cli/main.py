@@ -1855,13 +1855,17 @@ def mine(
                 "(proof on %s, reserve %.1f GiB)",
                 gpu_memory_utilization, proof_device, reserve_gib,
             )
+            # Built once with placeholder weights: every checkpoint, this one
+            # included, is copied in from the proof model already in memory.
             generator = VLLMRolloutGenerator(
                 initial_path,
                 revision=base_load_kwargs.get("revision"),
                 max_num_seqs=MINER_VLLM_MAX_NUM_SEQS,
                 max_model_len=max_new_tokens + 8192,
                 gpu_memory_utilization=gpu_memory_utilization,
+                load_format="dummy",
             )
+            generator.set_weights(hf_model.named_parameters())
 
         engine = MiningEngine(
             vllm_model,

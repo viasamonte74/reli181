@@ -191,50 +191,90 @@ def test_rollout_indices_select_the_forced_stream():
     assert [f["rollout_index"] for f in forced] == [4, 5]
 
 
-def test_reload_swaps_weights_without_rebuilding():
-    class _Live:
-        def __init__(self):
-            self.calls = []
+class _StackedModel(torch.nn.Module):
+    """A vLLM-style model: q/k/v arrive separately and land in one parameter."""
 
-        def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
-            self.calls.append((method, args))
+    def __init__(self):
+        super().__init__()
+        self.qkv = torch.nn.Parameter(torch.zeros(3, 2))
+        self.norm = torch.nn.Parameter(torch.zeros(2))
 
-        def reset_prefix_cache(self, device=None):
-            self.calls.append(("reset_prefix_cache", ()))
+    def load_weights(self, weights):
+        loaded = set()
+        for name, tensor in weights:
+            if name.endswith(("q_proj", "k_proj", "v_proj")):
+                row = ("q_proj", "k_proj", "v_proj").index(name.rsplit(".", 1)[-1])
+                self.qkv.data[row].copy_(tensor)
+                loaded.add("qkv")
+            elif name == "norm":
+                self.norm.data.copy_(tensor)
+                loaded.add("norm")
+        return loaded
 
-    engine = _Live()
-    generator = VLLMRolloutGenerator(
-        "old", engine=engine, sampling_params_class=_FakeParams,
-    )
 
-    generator.reload("/snapshots/next", revision="abc")
+class _InProcessEngine:
+    """vLLM's LLM with the engine core in-process: RPC runs on the worker."""
+
+    def __init__(self, model):
+        worker = SimpleNamespace(model_runner=SimpleNamespace(get_model=lambda: model))
+        self._worker = worker
+        self.calls = []
+        self.llm_engine = SimpleNamespace(engine_core=type("InprocClient", (), {})())
+
+    def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        self.calls.append("collective_rpc")
+        return [method(self._worker, *args, **(kwargs or {}))]
+
+    def reset_prefix_cache(self, device=None):
+        self.calls.append("reset_prefix_cache")
+
+
+def _weights(scale: float):
+    return [
+        ("attn.q_proj", torch.full((2,), 1.0 * scale)),
+        ("attn.k_proj", torch.full((2,), 2.0 * scale)),
+        ("attn.v_proj", torch.full((2,), 3.0 * scale)),
+        ("norm", torch.full((2,), 4.0 * scale)),
+    ]
+
+
+def test_set_weights_writes_into_the_live_parameters(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    model = _StackedModel()
+    engine = _InProcessEngine(model)
+    generator = VLLMRolloutGenerator("m", engine=engine, sampling_params_class=_FakeParams)
+    storage = model.qkv.data_ptr()
+
+    generator.set_weights(_weights(1.0))
+    generator.set_weights(_weights(10.0))
 
     assert generator._llm is engine
-    assert generator.model_path == "/snapshots/next"
-    assert generator.revision == "abc"
-    assert [call[0] for call in engine.calls] == [
-        "update_config", "reload_weights", "reset_prefix_cache",
-    ]
-    assert engine.calls[0][1] == (
-        {"model_config": {"model": "/snapshots/next", "revision": "abc"}},
-    )
+    assert model.qkv.data_ptr() == storage
+    assert model.qkv.tolist() == [[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]]
+    assert model.norm.tolist() == [40.0, 40.0]
+    assert engine.calls == ["collective_rpc", "reset_prefix_cache"] * 2
 
 
-def test_reload_rebuilds_when_the_swap_fails():
-    class _Dead:
-        def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
-            raise RuntimeError("rpc failed")
+def test_set_weights_refuses_a_partial_update(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    engine = _InProcessEngine(_StackedModel())
+    generator = VLLMRolloutGenerator("m", engine=engine, sampling_params_class=_FakeParams)
 
-    built = object()
-    generator = VLLMRolloutGenerator(
-        "old", engine=_Dead(), sampling_params_class=_FakeParams,
-    )
-    generator._build = lambda path, revision: built
+    with pytest.raises(RuntimeError, match="1 parameters unset"):
+        generator.set_weights(_weights(1.0)[:3])
 
-    generator.reload("/snapshots/next")
+    assert "reset_prefix_cache" not in engine.calls
 
-    assert generator._llm is built
-    assert generator.model_path == "/snapshots/next"
+
+def test_set_weights_needs_the_engine_core_in_process():
+    engine = _InProcessEngine(_StackedModel())
+    engine.llm_engine.engine_core = type("SyncMPClient", (), {})()
+    generator = VLLMRolloutGenerator("m", engine=engine, sampling_params_class=_FakeParams)
+
+    with pytest.raises(RuntimeError, match="VLLM_ENABLE_V1_MULTIPROCESSING=0"):
+        generator.set_weights(_weights(1.0))
+
+    assert engine.calls == []
 
 
 def test_the_engine_is_only_built_when_none_is_supplied(monkeypatch):

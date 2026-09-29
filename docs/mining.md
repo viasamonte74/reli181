@@ -455,6 +455,7 @@ Environment variables:
 | `DRAND_CHAIN` | `quicknet` | Override only if drand announces a chain rotation. |
 | `GRAIL_ATTN_IMPL` | `flash_attention_2` | Override to `eager` or `sdpa` in test envs without flash-attn. Do not override on mainnet. |
 | `RELIQUARY_MINER_PIPELINE_DEPTH` | `auto` | Screened groups that may wait for the proof GPU while the generation GPU starts the next prompt. `auto` is 1 with separate generation/proof GPUs and 0 (sequential) on one GPU. Queued groups are re-checked against live state before their proof. |
+| `RELIQUARY_MINER_GENERATION_BACKEND` | `transformers` | `vllm` generates on vLLM (tested with 0.10.1.1 installed `--no-deps` beside torch 2.7.0; it needs numpy ≤ 2.2 for numba). The engine is built once with placeholder weights and runs in-process; every checkpoint, the first included, is copied into it from the proof model in about a second, with no rebuild and no disk re-read. |
 | `RELIQUARY_MINER_VLLM_RESERVE_GIB` | `2` | With the vLLM backend on a dedicated generation GPU, memory left free on `cuda:0`; vLLM takes the rest. |
 | `RELIQUARY_MINER_VLLM_SHARED_DEVICE_RESERVE_GIB` | `12` | Same, when vLLM shares its GPU with the proof model (room for the proof forward's full-sequence logits). |
 

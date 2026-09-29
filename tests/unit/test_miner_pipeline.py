@@ -249,6 +249,69 @@ def test_stale_group_reason_catches_moved_state():
     ) == "randomness_changed"
 
 
+class _LoadedModel:
+    def __init__(self, path):
+        self.path = path
+        self.weights = [(f"{path}.w", object())]
+
+    def to(self, device):
+        self.device = device
+        return self
+
+    def eval(self):
+        return self
+
+    def named_parameters(self):
+        return iter(self.weights)
+
+
+def _checkpoint_engine(generator):
+    eng = object.__new__(MiningEngine)
+    eng.hf_model = _LoadedModel("old")
+    eng.vllm_model = _LoadedModel("old")
+    eng.proof_gpu, eng.vllm_gpu = 1, 0
+    eng.generation_device = "cpu"
+    eng.generator = generator
+    return eng
+
+
+def test_checkpoint_change_sets_vllm_weights_from_the_proof_copy():
+    pushed = []
+    generator = SimpleNamespace(
+        set_weights=lambda named: pushed.append(list(named)),
+        reload=MagicMock(side_effect=AssertionError("must not rebuild or re-read")),
+    )
+    eng = _checkpoint_engine(generator)
+
+    with patch("reliquary.shared.modeling.load_text_generation_model", _load_model):
+        eng._load_checkpoint("/snapshots/next")
+
+    assert eng.hf_model.device == "cuda:1"
+    assert pushed == [eng.hf_model.weights]
+    generator.reload.assert_not_called()
+
+
+def test_failed_vllm_weight_set_requires_a_restart():
+    from reliquary.miner.engine import CheckpointActivationRestartRequired
+
+    def _fail(named):
+        raise RuntimeError("worker died")
+
+    eng = _checkpoint_engine(SimpleNamespace(set_weights=_fail))
+
+    with patch("reliquary.shared.modeling.load_text_generation_model", _load_model):
+        try:
+            eng._load_checkpoint("/snapshots/next")
+        except CheckpointActivationRestartRequired:
+            pass
+        else:
+            raise AssertionError("a failed in-place weight set must stop the miner")
+
+
+def _load_model(path, **_kwargs):
+    return _LoadedModel(path)
+
+
 def test_vllm_memory_fraction_tracks_free_memory():
     from reliquary.miner.vllm_generation import gpu_memory_utilization_for
 
