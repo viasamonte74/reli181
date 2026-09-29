@@ -1564,6 +1564,85 @@ MINER_VLLM_RESERVE_GIB = float(
 MINER_VLLM_SHARED_DEVICE_RESERVE_GIB = float(
     _os.environ.get("RELIQUARY_MINER_VLLM_SHARED_DEVICE_RESERVE_GIB", "12")
 )
+# Miner-local only: a second vLLM engine, in its own process, on the proof
+# GPU. The proof copy is idle most of the time; its reserve must still hold a
+# staged checkpoint (~8 GB for a 4B model) plus one near-cap proof forward.
+MINER_PROOF_GPU_ENGINE = _os.environ.get(
+    "RELIQUARY_MINER_PROOF_GPU_ENGINE", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+MINER_PROOF_GPU_ENGINE_RESERVE_GIB = float(
+    _os.environ.get("RELIQUARY_MINER_PROOF_GPU_ENGINE_RESERVE_GIB", "12")
+)
+_MINER_PROOF_GPU_ENGINE_GROUPS_RAW = _os.environ.get(
+    "RELIQUARY_MINER_PROOF_GPU_ENGINE_GROUPS", ""
+).strip().lower()
+MINER_PROOF_GPU_ENGINE_GROUPS: int | None = (
+    None if _MINER_PROOF_GPU_ENGINE_GROUPS_RAW in ("", "auto")
+    else max(1, int(_MINER_PROOF_GPU_ENGINE_GROUPS_RAW))
+)
+MINER_PROOF_GPU_ENGINE_START_SECONDS = float(
+    _os.environ.get("RELIQUARY_MINER_PROOF_GPU_ENGINE_START_SECONDS", "900")
+)
+# vLLM only: prompt groups generating at once on the one engine. "auto" fits
+# their expected KV footprint (prompt + fraction x cap per rollout) into the
+# cache vLLM allocated; an integer pins it. Over-estimating costs preemption
+# and recompute, never correctness. Live Math/Code/Logic rollouts at an 8,192
+# cap average about 400-900 completion tokens, so the default fraction is 0.12.
+_MINER_VLLM_CONCURRENT_GROUPS_RAW = _os.environ.get(
+    "RELIQUARY_MINER_VLLM_CONCURRENT_GROUPS", "auto"
+).strip().lower()
+MINER_VLLM_CONCURRENT_GROUPS: int | None = (
+    None if _MINER_VLLM_CONCURRENT_GROUPS_RAW in ("", "auto")
+    else max(1, int(_MINER_VLLM_CONCURRENT_GROUPS_RAW))
+)
+MINER_VLLM_EXPECTED_COMPLETION_FRACTION = float(
+    _os.environ.get("RELIQUARY_MINER_VLLM_EXPECTED_COMPLETION_FRACTION", "0.12")
+)
+MINER_VLLM_EXPECTED_PROMPT_TOKENS = int(
+    _os.environ.get("RELIQUARY_MINER_VLLM_EXPECTED_PROMPT_TOKENS", "512")
+)
+# Miner-local only: a Math or Code group whose first N forced rollouts all
+# terminate cleanly with the same local score is dropped before the rest is
+# generated. The validator refuses any group whose 16 rewards all agree, and a
+# unanimous prefix this long is usually one. Lower drops earlier and loses more
+# borderline groups; 0 always finishes the group.
+MINER_UNANIMOUS_DROP_ROLLOUTS = max(0, int(
+    _os.environ.get("RELIQUARY_MINER_UNANIMOUS_DROP_ROLLOUTS", "8")
+))
+# Miner-local only: scale each open lane's pick weight by how many keepable
+# groups per generation-second that environment has produced recently.
+MINER_YIELD_WEIGHTING = _os.environ.get(
+    "RELIQUARY_MINER_YIELD_WEIGHTING", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+# Miner-local only: screen single-turn JSON-answer environments whose reward the
+# validator computes (reliquary_logic_v2) with the same pinned checker, staged
+# like Math. The claimed reward stays 0; the validator still scores the group.
+MINER_ANSWER_SCREEN = _os.environ.get(
+    "RELIQUARY_MINER_ANSWER_SCREEN", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+# Miner-local only: poll the checkpoint repository's head this often (seconds)
+# and download a new revision before validators advertise it, which they do
+# about a minute after it lands on the Hub. 0 disables.
+MINER_CHECKPOINT_PREFETCH_SECONDS = max(0.0, float(
+    _os.environ.get("RELIQUARY_MINER_CHECKPOINT_PREFETCH_SECONDS", "10")
+))
+# Miner-local only: after each activation, delete older cached revisions of the
+# checkpoint repository from the local Hub cache (about 8 GB each).
+MINER_PRUNE_CHECKPOINTS = _os.environ.get(
+    "RELIQUARY_MINER_PRUNE_CHECKPOINTS", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+# Miner-local only: proved groups whose state recheck and upload may run at
+# once while the proof GPU moves on to the next group.
+MINER_CONCURRENT_UPLOADS = max(1, int(
+    _os.environ.get("RELIQUARY_MINER_CONCURRENT_UPLOADS", "4")
+))
+# Miner-local only: what one selected group pays in each lane, relative to the
+# others ("openmathinstruct=2.66,reliquary_logic_v2=1"). Lane picks are scaled
+# by value x yield. A price the validator publishes at GET /tasks overrides it.
+MINER_LANE_VALUES = _os.environ.get("RELIQUARY_MINER_LANE_VALUES", "")
+MINER_LIVE_LANE_PRICES = _os.environ.get(
+    "RELIQUARY_MINER_LIVE_LANE_PRICES", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 
 
 PPO_CLIP_EPSILON_LOW = 0.2

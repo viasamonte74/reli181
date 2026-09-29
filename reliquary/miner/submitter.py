@@ -665,6 +665,17 @@ async def get_verdicts_page_v1(
     )
 
 
+def log_submission_verdict(verdict) -> None:
+    logger.info(
+        "verdict window=%s prompt=%s root=%s accepted=%s selected=%s status=%s reason=%s proof=%s details=%s",
+        verdict.window_n, verdict.prompt_idx, verdict.merkle_root,
+        verdict.accepted, verdict.selected_for_batch,
+        verdict.selection_status or "legacy",
+        verdict.outcome_code or verdict.selection_reason or verdict.reason,
+        verdict.proof_reason, verdict.reason_details,
+    )
+
+
 @asynccontextmanager
 async def monitor_submission_verdicts(url, hotkey, client, submitted, *, on_verdict=None):
     """Poll after the first accepted submission; own and cancel the HTTP task."""
@@ -684,14 +695,7 @@ async def monitor_submission_verdicts(url, hotkey, client, submitted, *, on_verd
                     if on_verdict is not None:
                         on_verdict(verdict)
                     else:
-                        logger.info(
-                            "verdict window=%s prompt=%s root=%s accepted=%s selected=%s status=%s reason=%s proof=%s details=%s",
-                            verdict.window_n, verdict.prompt_idx, verdict.merkle_root,
-                            verdict.accepted, verdict.selected_for_batch,
-                            verdict.selection_status or "legacy",
-                            verdict.outcome_code or verdict.selection_reason or verdict.reason,
-                            verdict.proof_reason, verdict.reason_details,
-                        )
+                        log_submission_verdict(verdict)
                 cursor, stream_id = page.next_cursor, page.stream_id
                 failures, delay = 0, 5.0
             except EndpointNotFoundError:

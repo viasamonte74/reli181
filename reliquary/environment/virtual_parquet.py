@@ -386,6 +386,29 @@ class VirtualParquetDataset:
                         self._cache.popitem(last=False)
         return rows[idx - rg_start]
 
+    def prefetch(self, lo: int, hi: int, *, limit: int = 16) -> int:
+        """Load the row-groups covering rows ``[lo, hi)`` into the cache.
+
+        Returns how many row-groups the range touched (cached or fetched),
+        stopping at ``limit`` so a huge range cannot evict the whole cache.
+        """
+        self._ensure_manifest()
+        assert self._total and self._rg_start is not None
+        limit = min(limit, max(1, self._cache_cap // 2))
+        touched = 0
+        idx = lo
+        while idx < hi and touched < limit:
+            row = idx % self._total
+            gi = bisect.bisect_right(self._rg_start, row) - 1
+            self.get_row(row)
+            touched += 1
+            end = (
+                self._rg_start[gi + 1]
+                if gi + 1 < len(self._rg_start) else self._total
+            )
+            idx += end - row
+        return touched
+
     def _fetch_row_group(self, file_idx: int, rg_idx: int) -> list[dict]:
         pf = self._parquet_file(file_idx)
         table = pf.read_row_group(rg_idx, columns=self._columns)

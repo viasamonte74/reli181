@@ -327,3 +327,21 @@ def test_filename_prefix_filters_the_cached_manifest_fallback(tmp_path, monkeypa
 
     assert len(ds) == 4
     assert [ds.get_row(i)["v"] for i in range(4)] == [0, 1, 2, 3]
+
+
+def test_prefetch_caches_every_row_group_in_the_range(tmp_path):
+    ds, _ = _dataset(tmp_path)
+    assert ds.prefetch(1, 6) == 4
+    assert set(ds._cache) == {(0, 0), (0, 1), (0, 2), (1, 0)}
+
+
+def test_prefetch_wraps_past_the_end(tmp_path):
+    ds, _ = _dataset(tmp_path)
+    assert ds.prefetch(7, 10) == 2
+    assert set(ds._cache) == {(1, 1), (0, 0)}
+
+
+def test_prefetch_never_fills_more_than_half_the_cache(tmp_path):
+    ds, _ = _dataset(tmp_path, cache_row_groups=4)
+    assert ds.prefetch(0, 8) == 2
+    assert len(ds._cache) == 2

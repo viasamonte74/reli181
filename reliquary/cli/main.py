@@ -25,7 +25,15 @@ from reliquary.constants import (
     DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
     MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
+    M_ROLLOUTS,
     MINER_GENERATION_BACKEND,
+    MINER_PROOF_GPU_ENGINE,
+    MINER_PROOF_GPU_ENGINE_GROUPS,
+    MINER_PROOF_GPU_ENGINE_RESERVE_GIB,
+    MINER_PROOF_GPU_ENGINE_START_SECONDS,
+    MINER_VLLM_CONCURRENT_GROUPS,
+    MINER_VLLM_EXPECTED_COMPLETION_FRACTION,
+    MINER_VLLM_EXPECTED_PROMPT_TOKENS,
     MINER_VLLM_MAX_NUM_SEQS,
     MINER_VLLM_RESERVE_GIB,
     MINER_VLLM_SHARED_DEVICE_RESERVE_GIB,
@@ -1828,6 +1836,10 @@ def mine(
             checkpoint_identity_store.commit(initial_checkpoint_identity)
 
         envs = load_environments(env_names)
+        from reliquary.miner.engine import _EnvironmentWarmup
+
+        # Overlaps the vLLM build below instead of the first mining window.
+        env_warmup = _EnvironmentWarmup(envs)
         generator = None
         if MINER_GENERATION_BACKEND == "vllm":
             from reliquary.miner.vllm_generation import (
@@ -1847,6 +1859,28 @@ def mine(
                 MINER_VLLM_SHARED_DEVICE_RESERVE_GIB
                 if shared_device else MINER_VLLM_RESERVE_GIB
             )
+            remote_generator = None
+            if MINER_PROOF_GPU_ENGINE and not shared_device:
+                from reliquary.miner.vllm_worker import RemoteVLLMGenerator
+
+                # Spawned first so its build overlaps the in-process one; it
+                # sizes itself from what the proof copy leaves free on cuda:1.
+                torch.cuda.empty_cache()
+                remote_generator = RemoteVLLMGenerator.spawn(
+                    initial_path, device=1,
+                    revision=base_load_kwargs.get("revision"),
+                    max_model_len=max_new_tokens + 8192,
+                    max_num_seqs=MINER_VLLM_MAX_NUM_SEQS,
+                    reserve_bytes=MINER_PROOF_GPU_ENGINE_RESERVE_GIB * 2**30,
+                )
+                logger.info(
+                    "second vLLM engine starting on cuda:1 (reserve %.1f GiB "
+                    "for the proof copy)", MINER_PROOF_GPU_ENGINE_RESERVE_GIB,
+                )
+            elif MINER_PROOF_GPU_ENGINE:
+                logger.warning(
+                    "RELIQUARY_MINER_PROOF_GPU_ENGINE needs a second GPU; ignored",
+                )
             gpu_memory_utilization = gpu_memory_utilization_for(
                 0, reserve_gib * 2**30,
             )
@@ -1866,6 +1900,65 @@ def mine(
                 load_format="dummy",
             )
             generator.set_weights(hf_model.named_parameters())
+            tokens_per_rollout = MINER_VLLM_EXPECTED_PROMPT_TOKENS + int(
+                MINER_VLLM_EXPECTED_COMPLETION_FRACTION * max_new_tokens
+            )
+            generation_concurrency = (
+                MINER_VLLM_CONCURRENT_GROUPS
+                or generator.concurrent_groups(
+                    rollouts=M_ROLLOUTS, tokens_per_rollout=tokens_per_rollout,
+                )
+            )
+            logger.info(
+                "vLLM KV cache %s tokens; %d prompt groups at once (%s, ~%d "
+                "tokens per rollout, max_num_seqs=%d)",
+                generator.kv_cache_tokens(), generation_concurrency,
+                "pinned" if MINER_VLLM_CONCURRENT_GROUPS else "auto",
+                tokens_per_rollout, MINER_VLLM_MAX_NUM_SEQS,
+            )
+            if remote_generator is not None:
+                from reliquary.miner.vllm_worker import PooledGenerator
+
+                try:
+                    remote_generator.wait_ready(MINER_PROOF_GPU_ENGINE_START_SECONDS)
+                except Exception:
+                    logger.exception(
+                        "second vLLM engine did not start; generating on cuda:0 only",
+                    )
+                else:
+                    local_kv = generator.kv_cache_tokens()
+                    remote_kv = remote_generator.kv_cache_tokens()
+                    if MINER_PROOF_GPU_ENGINE_GROUPS:
+                        remote_groups = MINER_PROOF_GPU_ENGINE_GROUPS
+                    elif MINER_VLLM_CONCURRENT_GROUPS and local_kv and remote_kv:
+                        # A pinned first engine is the operator's measured
+                        # load; hold the second to the same groups per token.
+                        remote_groups = max(1, round(
+                            MINER_VLLM_CONCURRENT_GROUPS * remote_kv / local_kv
+                        ))
+                    else:
+                        remote_groups = remote_generator.concurrent_groups(
+                            rollouts=M_ROLLOUTS,
+                            tokens_per_rollout=tokens_per_rollout,
+                        )
+                    generator = PooledGenerator([
+                        (generator, generation_concurrency),
+                        (remote_generator, remote_groups),
+                    ])
+                    generation_concurrency += remote_groups
+                    logger.info(
+                        "second vLLM engine ready on cuda:1: KV cache %s tokens, "
+                        "gpu_memory_utilization=%.3f, %d prompt groups (%s); "
+                        "%d groups at once in total",
+                        remote_generator.kv_cache_tokens(),
+                        remote_generator.gpu_memory_utilization or 0.0,
+                        remote_groups,
+                        "pinned" if MINER_PROOF_GPU_ENGINE_GROUPS
+                        else "scaled" if MINER_VLLM_CONCURRENT_GROUPS else "auto",
+                        generation_concurrency,
+                    )
+        else:
+            generation_concurrency = 1
 
         engine = MiningEngine(
             vllm_model,
@@ -1876,11 +1969,17 @@ def mine(
             mix=mix,
             generator=generator,
             generation_device=generation_device,
+            generation_concurrency=generation_concurrency,
             proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
             checkpoint_identity_store=checkpoint_identity_store,
             initial_checkpoint_identity=initial_checkpoint_identity,
+            env_warmup=env_warmup,
         )
+        # The engine owns the models from here. A checkpoint reload stages the
+        # next proof copy beside the current one, so a startup copy pinned by
+        # these locals leaves no room for it on a GPU shared with an engine.
+        del vllm_model, hf_model
 
         # Seed engine's _loaded_checkpoint_path so the first
         # maybe_pull_checkpoint sees we're already synced (skips redundant reload).

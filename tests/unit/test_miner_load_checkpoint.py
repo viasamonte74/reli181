@@ -85,6 +85,43 @@ def test_load_checkpoint_vllm_load_failure_keeps_old_pair(mock_engine):
     assert getattr(mock_engine, "_loaded_checkpoint_path", None) is None
 
 
+class _CyclicModel:
+    def __init__(self):
+        self.me = self
+
+    def to(self, _device):
+        return self
+
+    def eval(self):
+        return self
+
+
+def test_load_checkpoint_frees_replaced_models_before_returning(mock_engine):
+    """The replaced proof copy is collected during the swap, cycles included,
+    so the next reload has room to stage beside the current copy."""
+    import gc
+    import weakref
+
+    old_hf, old_gen = _CyclicModel(), _CyclicModel()
+    old_hf_ref, old_gen_ref = weakref.ref(old_hf), weakref.ref(old_gen)
+    mock_engine.hf_model, mock_engine.vllm_model = old_hf, old_gen
+    del old_hf, old_gen
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with patch(
+            "reliquary.shared.modeling.load_text_generation_model",
+            side_effect=[_make_hf_mock("new_hf"), _make_hf_mock("new_gen")],
+        ):
+            mock_engine._load_checkpoint("/tmp/checkpoint-6")
+        assert old_hf_ref() is None
+        assert old_gen_ref() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
 def test_same_device_activation_moves_old_pair_to_host_first(mock_engine):
     mock_engine.proof_gpu = 0
     mock_engine.vllm_gpu = 0

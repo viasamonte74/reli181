@@ -3,16 +3,19 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from reliquary.constants import M_ROLLOUTS
 from reliquary.miner.code_zone_screen import score_group
 from reliquary.miner.engine import (
     MiningEngine,
+    _EnvironmentYield,
     _eligible_generation_mix,
     _proof_termination_kind,
     _structural_termination_kind,
     _termination_upload_skip_reason,
+    _unanimous_screen_stops,
 )
 
 
@@ -145,6 +148,140 @@ def test_eos_that_is_the_forced_pick_is_submitted():
         token_logprobs=[-0.1],
     )
     assert kind == "ok"
+
+
+_CASES = [{"entry": {"kind": "function", "name": "add"}}]
+
+
+STAGED_ROLLOUTS = 16
+
+
+def _staged_code_engine(monkeypatch, *, tokens=(0, 1)):
+    monkeypatch.setattr("reliquary.constants.MINER_UNANIMOUS_DROP_ROLLOUTS", 8)
+    monkeypatch.setattr("reliquary.miner.engine.M_ROLLOUTS", STAGED_ROLLOUTS)
+    engine = _engine()
+    seen: list[list[int]] = []
+
+    def _generate(*args, **kwargs):
+        indices = kwargs["rollout_indices"]
+        seen.append(list(indices))
+        return [{"tokens": list(tokens), "prompt_length": 1} for _ in indices]
+
+    engine._generate_m_rollouts = _generate
+    return engine, seen
+
+
+def _screen_code(engine):
+    env = SimpleNamespace(admission_reward_cases=lambda problem: _CASES)
+    return engine._generate_code_screened_rollouts(
+        {}, "rand", env_name="opencodeinstruct", prompt_idx=3,
+        checkpoint_hash="abc", env=env,
+    )
+
+
+def test_code_prefix_that_agrees_for_eight_rollouts_is_dropped(monkeypatch):
+    engine, seen = _staged_code_engine(monkeypatch)
+    with patch(
+        "reliquary.miner.code_zone_screen.score_group",
+        side_effect=lambda codes, cases: [1.0] * len(codes),
+    ) as score:
+        generations, reason = _screen_code(engine)
+
+    assert generations is None and reason == "unanimous_prefix"
+    assert seen == [list(range(4)), list(range(4, 8))]
+    assert [len(call.args[0]) for call in score.call_args_list] == [4, 8]
+
+
+def test_code_prefix_that_splits_generates_the_rest_at_once(monkeypatch):
+    engine, seen = _staged_code_engine(monkeypatch)
+    with patch(
+        "reliquary.miner.code_zone_screen.score_group",
+        return_value=[1.0, 0.0, 1.0, 1.0],
+    ):
+        generations, reason = _screen_code(engine)
+
+    assert reason is None and len(generations) == STAGED_ROLLOUTS
+    assert seen == [list(range(4)), list(range(4, STAGED_ROLLOUTS))]
+
+
+def test_code_prefix_that_cannot_be_scored_finishes_the_group(monkeypatch):
+    engine, seen = _staged_code_engine(monkeypatch)
+    with patch("reliquary.miner.code_zone_screen.score_group", return_value=None):
+        generations, reason = _screen_code(engine)
+
+    assert reason is None and len(generations) == STAGED_ROLLOUTS
+    assert seen == [list(range(4)), list(range(4, STAGED_ROLLOUTS))]
+
+
+def test_code_prefix_with_a_bad_termination_is_dropped_unscored(monkeypatch):
+    engine, seen = _staged_code_engine(monkeypatch, tokens=(0, 2))
+    with patch("reliquary.miner.code_zone_screen.score_group") as score:
+        generations, reason = _screen_code(engine)
+
+    assert generations is None and reason == "bad_termination"
+    assert seen == [list(range(4))]
+    score.assert_not_called()
+
+
+def test_code_cases_run_without_the_host_turn():
+    engine = _engine()
+    turn = engine._host_turn()
+    free_while_scoring = []
+
+    def _score(codes, cases):
+        free_while_scoring.append(turn._lock.acquire(blocking=False))
+        if free_while_scoring[-1]:
+            turn._lock.release()
+        return [1.0] * len(codes)
+
+    env = SimpleNamespace(admission_reward_cases=lambda problem: _CASES)
+    with turn.hold(), patch("reliquary.miner.code_zone_screen.score_group", _score):
+        engine._code_screen_rewards(env, {}, _generations())
+        assert not turn._lock.acquire(blocking=False)
+    assert free_while_scoring == [True]
+
+
+def test_yield_weighting_favours_the_lane_keeping_groups_fastest():
+    tracker = _EnvironmentYield()
+    tracker.start_window(1)
+    for _ in range(6):
+        tracker.observe("reliquary_logic_v2", 30.0, kept=True)
+    for _ in range(6):
+        tracker.observe("opencodeinstruct", 30.0, kept=False)
+
+    weights = dict(tracker.weigh([
+        ("reliquary_logic_v2", 10), ("opencodeinstruct", 10),
+    ]))
+
+    assert weights["reliquary_logic_v2"] > 5 * weights["opencodeinstruct"]
+    assert tracker.weigh([("opencodeinstruct", 10)]) == [("opencodeinstruct", 10)]
+
+
+def test_yield_history_decays_per_window_and_takes_back_refusals():
+    tracker = _EnvironmentYield()
+    tracker.start_window(1)
+    tracker.observe("reliquary_logic_v2", 100.0, kept=True)
+    tracker.observe("reliquary_logic_v2", 100.0, kept=True)
+    before = tracker.rate("reliquary_logic_v2")
+
+    tracker.retract("reliquary_logic_v2")
+    assert tracker.rate("reliquary_logic_v2") < before
+
+    assert tracker.start_window(1) is False
+    assert tracker.start_window(2) is True
+    decayed = tracker.rate("reliquary_logic_v2")
+    assert decayed == pytest.approx(
+        (0.8 + tracker.PRIOR_KEPT) / (160.0 + tracker.PRIOR_SECONDS),
+    )
+
+
+@pytest.mark.parametrize(
+    ("drop", "stops"),
+    [(8, [4, 8, 16]), (4, [4, 16]), (0, [4, 16]), (32, [4, 16])],
+)
+def test_unanimous_screen_stops(monkeypatch, drop, stops):
+    monkeypatch.setattr("reliquary.constants.MINER_UNANIMOUS_DROP_ROLLOUTS", drop)
+    assert _unanimous_screen_stops(16) == stops
 
 
 def test_mixed_code_group_is_submitted():

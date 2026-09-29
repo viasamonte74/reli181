@@ -5,6 +5,8 @@ the moment a request leaves it, so these tests pin the bookkeeping as much as
 the arithmetic: a stale slot would silently draw another rollout's stream.
 """
 
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +16,9 @@ from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
 from reliquary.environment.forced_sampling import pick, u_at, warp
 from reliquary.miner.vllm_generation import (
     ForcedSeedVLLMProcessor,
+    GenerationAborted,
     VLLMRolloutGenerator,
+    concurrent_groups_for,
     forced_seed_extra_args,
 )
 
@@ -128,26 +132,72 @@ class _FakeParams(SimpleNamespace):
 
 
 class _FakeEngine:
-    """Enough of vLLM's LLM to check what the generator asks for and returns."""
+    """vLLM's LLM reduced to the V1 engine calls the generator loop makes.
 
-    def __init__(self, completions):
+    ``completions[rollout_index]`` is what that rollout generates. Each step
+    finishes the oldest running request; with ``gate`` set, a step waits for it,
+    which holds requests in flight.
+    """
+
+    def __init__(self, completions, *, gate=None, hold_until_added=0):
         self.completions = completions
-        self.seen = None
+        self.gate = gate
+        self.hold_until_added = hold_until_added
+        self.added = []
+        self.aborted = []
+        self.running = []
+        self.llm_engine = self
+        self._lock = threading.Lock()
 
-    def generate(self, requests, sampling, use_tqdm=False):
-        self.seen = (requests, sampling)
-        return [
-            SimpleNamespace(outputs=[SimpleNamespace(
-                token_ids=list(tokens), finish_reason="stop", stop_reason=None,
-            )])
-            for tokens in self.completions
-        ]
+    def add_request(self, request_id, prompt, params):
+        with self._lock:
+            self.added.append((request_id, prompt, params))
+            self.running.append((request_id, params))
+
+    def abort_request(self, request_ids):
+        with self._lock:
+            self.aborted.extend(request_ids)
+            self.running = [r for r in self.running if r[0] not in set(request_ids)]
+
+    def has_unfinished_requests(self):
+        with self._lock:
+            return bool(self.running)
+
+    def step(self):
+        if self.gate is not None:
+            assert self.gate.wait(timeout=5)
+        with self._lock:
+            if not self.running or len(self.added) < self.hold_until_added:
+                return []
+            request_id, params = self.running.pop(0)
+        index = params.extra_args["forced_seed"]["rollout_index"]
+        return [SimpleNamespace(
+            request_id=request_id, finished=True,
+            outputs=[SimpleNamespace(token_ids=list(self.completions[index]))],
+        )]
+
+    def requests(self):
+        return [prompt for _, prompt, _ in self.added]
+
+    def sampling(self):
+        return [params for _, _, params in self.added]
+
+
+def _generator(engine):
+    return VLLMRolloutGenerator("model", engine=engine, sampling_params_class=_FakeParams)
+
+
+def _submit(generator, prompt_idx, rollouts, **kwargs):
+    return generator.submit(
+        [prompt_idx, 1], randomness=RANDOMNESS, prompt_idx=prompt_idx,
+        checkpoint_hash=CHECKPOINT, rollouts=rollouts, max_new_tokens=64,
+        eos_ids=[99], **kwargs,
+    )
 
 
 def test_the_generator_truncates_at_the_first_stop_token():
     engine = _FakeEngine([[11, 12, 99, 13], [21, 22, 23]])
-    generator = VLLMRolloutGenerator(
-        "model", engine=engine, sampling_params_class=_FakeParams)
+    generator = _generator(engine)
 
     completions = generator.generate(
         [1, 2, 3], randomness=RANDOMNESS, prompt_idx=7, checkpoint_hash=CHECKPOINT,
@@ -159,16 +209,15 @@ def test_the_generator_truncates_at_the_first_stop_token():
 
 def test_every_rollout_asks_for_its_own_stream():
     engine = _FakeEngine([[1], [2], [3]])
-    generator = VLLMRolloutGenerator(
-        "model", engine=engine, sampling_params_class=_FakeParams)
+    generator = _generator(engine)
 
     generator.generate(
         [5, 6], randomness=RANDOMNESS, prompt_idx=42, checkpoint_hash=CHECKPOINT,
         rollouts=3, max_new_tokens=8, eos_ids=[99],
     )
 
-    requests, sampling = engine.seen
-    assert [r["prompt_token_ids"] for r in requests] == [[5, 6]] * 3
+    sampling = engine.sampling()
+    assert [r["prompt_token_ids"] for r in engine.requests()] == [[5, 6]] * 3
     forced = [p.extra_args["forced_seed"] for p in sampling]
     assert [f["rollout_index"] for f in forced] == [0, 1, 2]
     assert {f["prompt_idx"] for f in forced} == {42}
@@ -178,17 +227,139 @@ def test_every_rollout_asks_for_its_own_stream():
 
 
 def test_rollout_indices_select_the_forced_stream():
-    engine = _FakeEngine([[1], [2]])
-    generator = VLLMRolloutGenerator(
-        "model", engine=engine, sampling_params_class=_FakeParams)
+    engine = _FakeEngine({4: [1], 5: [2]})
+    generator = _generator(engine)
 
-    generator.generate(
+    completions = generator.generate(
         [5, 6], randomness=RANDOMNESS, prompt_idx=42, checkpoint_hash=CHECKPOINT,
         rollouts=2, max_new_tokens=8, eos_ids=[99], rollout_indices=[4, 5],
     )
 
-    forced = [p.extra_args["forced_seed"] for p in engine.seen[1]]
+    forced = [p.extra_args["forced_seed"] for p in engine.sampling()]
     assert [f["rollout_index"] for f in forced] == [4, 5]
+    assert completions == [[1], [2]]
+
+
+def test_groups_from_several_prompts_share_the_engine():
+    # No request finishes until both groups are inside the engine.
+    engine = _FakeEngine([[10, 99], [20, 99], [30, 99]], hold_until_added=5)
+    generator = _generator(engine)
+
+    first = _submit(generator, 1, 3)
+    second = _submit(generator, 2, 2)
+
+    assert first.result(timeout=5) == [[10, 99], [20, 99], [30, 99]]
+    assert second.result(timeout=5) == [[10, 99], [20, 99]]
+    assert {p["prompt_token_ids"][0] for p in engine.requests()} == {1, 2}
+    generator.close()
+
+
+def test_a_group_with_too_many_truncated_rollouts_is_abandoned():
+    engine = _FakeEngine([[1, 2], [3, 4], [5, 99], [6, 99]])
+    generator = _generator(engine)
+
+    future = _submit(generator, 3, 4, max_truncated=1)
+
+    with pytest.raises(GenerationAborted) as caught:
+        future.result(timeout=5)
+    assert caught.value.reason == "too_many_truncated"
+    deadline = time.monotonic() + 5
+    while engine.running and time.monotonic() < deadline:
+        time.sleep(0.01)
+    # The two rollouts still running were not generated to the end.
+    assert sorted(engine.aborted) == sorted(r for r, _, _ in engine.added[2:])
+    generator.close()
+
+
+def test_truncation_within_the_allowance_still_completes():
+    engine = _FakeEngine([[1, 2], [5, 99], [6, 99]])
+    generator = _generator(engine)
+
+    assert _submit(generator, 3, 3, max_truncated=1).result(timeout=5) == [
+        [1, 2], [5, 99], [6, 99],
+    ]
+    generator.close()
+
+
+def test_abort_drops_only_the_tagged_groups():
+    gate = threading.Event()
+    engine = _FakeEngine([[1, 99], [2, 99]], gate=gate)
+    generator = _generator(engine)
+    with generator.tagged("stale"):
+        stale = _submit(generator, 1, 2)
+    with generator.tagged("live"):
+        live = _submit(generator, 2, 2)
+
+    assert generator.abort(lambda tag: tag == "stale", reason="window_changed") == 1
+    gate.set()
+
+    with pytest.raises(GenerationAborted, match="window_changed"):
+        stale.result(timeout=5)
+    assert live.result(timeout=5) == [[1, 99], [2, 99]]
+    # Stale requests not yet added are skipped, the rest aborted; none of the
+    # live group's are touched.
+    assert engine.aborted and all(r.startswith("g0-") for r in engine.aborted)
+    assert not any(
+        r.startswith("g0-") and r not in engine.aborted for r, _, _ in engine.added[1:]
+    )
+    assert generator.in_flight() == 0
+    generator.close()
+
+
+def test_generate_waits_through_the_callers_wait():
+    engine = _FakeEngine([[7, 99]])
+    generator = _generator(engine)
+    waited = []
+
+    def wait(future):
+        waited.append(future)
+        return future.result(timeout=5)
+
+    assert generator.generate(
+        [1], randomness=RANDOMNESS, prompt_idx=1, checkpoint_hash=CHECKPOINT,
+        rollouts=1, max_new_tokens=8, eos_ids=[99], wait=wait,
+    ) == [[7, 99]]
+    assert len(waited) == 1
+    generator.close()
+
+
+def test_a_preempted_request_resumes_at_the_tokens_it_already_has():
+    torch.manual_seed(5)
+    logits = torch.randn(1, VOCAB)
+    processor = ForcedSeedVLLMProcessor()
+    processor.update_state(_update(added=[
+        (0, _params(rollout_index=3, base_offset=2), [1, 2], [8, 9, 10]),
+    ]))
+
+    chosen = int(processor.apply(logits.clone())[0].argmax())
+
+    assert chosen == _expected(logits[0], rollout_index=3, step=5)
+
+
+@pytest.mark.parametrize(
+    ("kv_tokens", "expected"),
+    [
+        (251_808, 6),     # 16 rollouts x 2,560 expected tokens each
+        (40_000, 1),      # less than one group's footprint still runs one
+        (None, 1),        # unknown capacity: one group at a time
+        (10_000_000, 16), # bounded by max_num_seqs // rollouts
+    ],
+)
+def test_concurrent_groups_follow_kv_capacity(kv_tokens, expected):
+    assert concurrent_groups_for(
+        kv_tokens, rollouts=16, tokens_per_rollout=2_560, max_num_seqs=256,
+    ) == expected
+
+
+def test_the_generator_reads_capacity_from_the_engine_config():
+    engine = _FakeEngine([])
+    engine.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks=15_738, block_size=16),
+    )
+    generator = _generator(engine)
+
+    assert generator.kv_cache_tokens() == 251_808
+    assert generator.concurrent_groups(rollouts=16, tokens_per_rollout=2_560) == 6
 
 
 class _StackedModel(torch.nn.Module):

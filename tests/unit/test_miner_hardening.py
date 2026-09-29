@@ -323,6 +323,102 @@ def test_zone_screen_finishes_the_remaining_forced_indices(monkeypatch):
     ]
 
 
+STAGED_ROLLOUTS = 16
+
+
+def _staged_math_engine(monkeypatch, texts):
+    """Engine whose rollout ``i`` answers ``texts[i]``; records each stage."""
+    monkeypatch.setattr("reliquary.constants.BFT_ENABLED", False)
+    monkeypatch.setattr("reliquary.constants.MINER_LOCAL_ZONE_FILTER", True)
+    monkeypatch.setattr("reliquary.miner.engine.M_ROLLOUTS", STAGED_ROLLOUTS)
+    monkeypatch.setattr(
+        "reliquary.shared.modeling.resolve_eos_token_ids", lambda *args: {EOS},
+    )
+    eng = object.__new__(MiningEngine)
+    eng.vllm_model = MagicMock()
+    eng.tokenizer = MagicMock()
+    eng.max_new_tokens = 8192
+    seen: list[list[int]] = []
+
+    def _generate(*args, **kwargs):
+        indices = kwargs["rollout_indices"]
+        seen.append(list(indices))
+        return [
+            {"tokens": [0, 1, EOS], "prompt_length": 1, "text": texts[i]}
+            for i in indices
+        ]
+
+    def _score(env, problem, generations):
+        return (
+            [list(g["tokens"][1:]) for g in generations],
+            [g["text"] for g in generations],
+            [1.0 if g["text"] == CORRECT else 0.0 for g in generations],
+        )
+
+    eng._generate_m_rollouts = _generate
+    eng._score_generations = _score
+    return eng, seen
+
+
+def _screen_math(eng):
+    return eng._generate_zone_screened_rollouts(
+        {"prompt": "p"}, "rand", env_name="openmathinstruct", prompt_idx=3,
+        checkpoint_hash="abc", env=MagicMock(),
+    )
+
+
+def test_zone_screen_drops_a_short_unanimous_prefix_of_eight(
+    monkeypatch, v1_math_gates,
+):
+    monkeypatch.setattr("reliquary.constants.MINER_UNANIMOUS_DROP_ROLLOUTS", 8)
+    eng, seen = _staged_math_engine(monkeypatch, [CORRECT] * STAGED_ROLLOUTS)
+
+    generations, reason = _screen_math(eng)
+
+    assert generations is None and reason == "unanimous_prefix"
+    assert seen == [list(range(4)), list(range(4, 8))]
+
+
+def test_zone_screen_finishes_once_the_second_stage_splits(
+    monkeypatch, v1_math_gates,
+):
+    monkeypatch.setattr("reliquary.constants.MINER_UNANIMOUS_DROP_ROLLOUTS", 8)
+    texts = [CORRECT] * STAGED_ROLLOUTS
+    texts[6] = WRONG
+    eng, seen = _staged_math_engine(monkeypatch, texts)
+
+    generations, reason = _screen_math(eng)
+
+    assert reason is None
+    assert [g["text"] for g in generations] == texts
+    assert seen == [
+        list(range(4)), list(range(4, 8)), list(range(8, STAGED_ROLLOUTS)),
+    ]
+
+
+def test_zone_screen_never_drops_a_finished_group(monkeypatch, v1_math_gates):
+    monkeypatch.setattr("reliquary.constants.MINER_UNANIMOUS_DROP_ROLLOUTS", 8)
+    eng, seen = _staged_math_engine(monkeypatch, [CORRECT] * 8)
+    monkeypatch.setattr("reliquary.miner.engine.M_ROLLOUTS", 8)
+
+    generations, reason = _screen_math(eng)
+
+    assert reason is None and len(generations) == 8
+    assert seen == [list(range(4)), list(range(4, 8))]
+
+
+def test_zone_screen_without_unanimous_drop_finishes_the_group(
+    monkeypatch, v1_math_gates,
+):
+    monkeypatch.setattr("reliquary.constants.MINER_UNANIMOUS_DROP_ROLLOUTS", 0)
+    eng, seen = _staged_math_engine(monkeypatch, [CORRECT] * STAGED_ROLLOUTS)
+
+    generations, reason = _screen_math(eng)
+
+    assert reason is None and len(generations) == STAGED_ROLLOUTS
+    assert seen == [list(range(4)), list(range(4, STAGED_ROLLOUTS))]
+
+
 def test_attempted_prompt_journal_is_window_scoped(tmp_path):
     journal = AttemptedPromptJournal(tmp_path / "attempted.json")
     journal.save(
